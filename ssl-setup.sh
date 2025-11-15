@@ -24,11 +24,21 @@ log_error() {
     echo -e "${RED}[ERROR]${NC} $1"
 }
 
-# Check if running as root
-check_root() {
+# Check if running as root or with sudo
+check_privileges() {
     if [[ $EUID -eq 0 ]]; then
-        log_error "This script should not be run as root"
-        exit 1
+        log_info "Running as root user"
+        SUDO=""
+    else
+        # Check if user has sudo privileges
+        if sudo -n true 2>/dev/null; then
+            log_info "Running with sudo privileges"
+            SUDO="sudo"
+        else
+            log_error "This script requires root privileges"
+            log_info "Please run as root or with sudo privileges"
+            exit 1
+        fi
     fi
 }
 
@@ -67,10 +77,10 @@ update_packages() {
     log_info "Updating package lists..."
     case $PKG_MANAGER in
         apt)
-            sudo apt update -y
+            $SUDO apt update -y
             ;;
         yum|dnf)
-            sudo $PKG_MANAGER update -y
+            $SUDO $PKG_MANAGER update -y
             ;;
     esac
 }
@@ -84,10 +94,10 @@ install_dependencies() {
         log_info "Installing Nginx..."
         case $PKG_MANAGER in
             apt)
-                sudo apt install -y nginx
+                $SUDO apt install -y nginx
                 ;;
             yum|dnf)
-                sudo $PKG_MANAGER install -y nginx
+                $SUDO $PKG_MANAGER install -y nginx
                 ;;
         esac
     else
@@ -99,10 +109,10 @@ install_dependencies() {
         log_info "Installing Certbot..."
         case $PKG_MANAGER in
             apt)
-                sudo apt install -y certbot python3-certbot-nginx
+                $SUDO apt install -y certbot python3-certbot-nginx
                 ;;
             yum|dnf)
-                sudo $PKG_MANAGER install -y certbot python3-certbot-nginx
+                $SUDO $PKG_MANAGER install -y certbot python3-certbot-nginx
                 ;;
         esac
     else
@@ -112,10 +122,10 @@ install_dependencies() {
     # Install other dependencies
     case $PKG_MANAGER in
         apt)
-            sudo apt install -y curl dnsutils
+            $SUDO apt install -y curl dnsutils
             ;;
         yum|dnf)
-            sudo $PKG_MANAGER install -y curl bind-utils
+            $SUDO $PKG_MANAGER install -y curl bind-utils
             ;;
     esac
 }
@@ -189,7 +199,7 @@ setup_nginx() {
     # Create nginx config
     NGINX_CONF="/etc/nginx/sites-available/$FULL_DOMAIN"
     
-    sudo tee "$NGINX_CONF" > /dev/null <<EOF
+    $SUDO tee "$NGINX_CONF" > /dev/null <<EOF
 server {
     listen 80;
     server_name $FULL_DOMAIN;
@@ -206,18 +216,18 @@ EOF
 
     # Enable site
     if [[ ! -f "/etc/nginx/sites-enabled/$FULL_DOMAIN" ]]; then
-        sudo ln -s "$NGINX_CONF" "/etc/nginx/sites-enabled/"
+        $SUDO ln -s "$NGINX_CONF" "/etc/nginx/sites-enabled/"
     fi
     
     # Test nginx configuration
     log_info "Testing Nginx configuration..."
-    if ! sudo nginx -t; then
+    if ! $SUDO nginx -t; then
         log_error "Nginx configuration test failed"
         exit 1
     fi
     
     # Reload nginx
-    sudo systemctl reload nginx
+    $SUDO systemctl reload nginx
     log_success "Nginx configuration applied"
 }
 
@@ -225,7 +235,7 @@ EOF
 obtain_ssl() {
     log_info "Obtaining SSL certificate for $FULL_DOMAIN..."
     
-    if sudo certbot --nginx -d "$FULL_DOMAIN" --non-interactive --agree-tos --email admin@"$DOMAIN" --redirect; then
+    if $SUDO certbot --nginx -d "$FULL_DOMAIN" --non-interactive --agree-tos --email admin@"$DOMAIN" --redirect; then
         log_success "SSL certificate obtained successfully"
     else
         log_error "Failed to obtain SSL certificate"
@@ -238,7 +248,7 @@ setup_auto_renewal() {
     log_info "Setting up auto-renewal..."
     
     # Test renewal
-    if sudo certbot renew --dry-run; then
+    if $SUDO certbot renew --dry-run; then
         log_success "Auto-renewal test successful"
     else
         log_warning "Auto-renewal test failed, but continuing"
@@ -246,8 +256,8 @@ setup_auto_renewal() {
     
     # Add cron job if not exists
     CRON_JOB="0 12 * * * /usr/bin/certbot renew --quiet"
-    if ! sudo crontab -l 2>/dev/null | grep -q "certbot renew"; then
-        (sudo crontab -l 2>/dev/null; echo "$CRON_JOB") | sudo crontab -
+    if ! $SUDO crontab -l 2>/dev/null | grep -q "certbot renew"; then
+        ($SUDO crontab -l 2>/dev/null; echo "$CRON_JOB") | $SUDO crontab -
         log_success "Auto-renewal cron job added"
     else
         log_info "Auto-renewal cron job already exists"
@@ -259,7 +269,7 @@ final_verification() {
     log_info "Performing final verification..."
     
     # Check if SSL certificate is valid
-    if sudo certbot certificates | grep -q "$FULL_DOMAIN"; then
+    if $SUDO certbot certificates | grep -q "$FULL_DOMAIN"; then
         log_success "SSL certificate verified"
     else
         log_error "SSL certificate verification failed"
@@ -286,7 +296,7 @@ main() {
     clear
     log_info "Starting SSL setup automation..."
     
-    check_root
+    check_privileges
     detect_os
     update_packages
     install_dependencies
