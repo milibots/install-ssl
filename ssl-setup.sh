@@ -24,10 +24,10 @@ log_error() {
     echo -e "${RED}[ERROR]${NC} $1"
 }
 
-# Check if running as root or with sudo
+# Check privileges - ALLOW root for SSL setup
 check_privileges() {
     if [[ $EUID -eq 0 ]]; then
-        log_info "Running as root user"
+        log_info "Running as root - required for SSL setup"
         SUDO=""
     else
         # Check if user has sudo privileges
@@ -35,8 +35,8 @@ check_privileges() {
             log_info "Running with sudo privileges"
             SUDO="sudo"
         else
-            log_error "This script requires root privileges"
-            log_info "Please run as root or with sudo privileges"
+            log_error "This script requires root privileges for SSL setup"
+            log_info "Please run with: sudo bash ssl-setup.sh"
             exit 1
         fi
     fi
@@ -100,6 +100,9 @@ install_dependencies() {
                 $SUDO $PKG_MANAGER install -y nginx
                 ;;
         esac
+        # Start and enable nginx
+        $SUDO systemctl enable nginx
+        $SUDO systemctl start nginx
     else
         log_info "Nginx is already installed"
     fi
@@ -235,11 +238,16 @@ EOF
 obtain_ssl() {
     log_info "Obtaining SSL certificate for $FULL_DOMAIN..."
     
-    if $SUDO certbot --nginx -d "$FULL_DOMAIN" --non-interactive --agree-tos --email admin@"$DOMAIN" --redirect; then
+    # Generate a random email for Let's Encrypt
+    LE_EMAIL="admin@$DOMAIN"
+    
+    if $SUDO certbot --nginx -d "$FULL_DOMAIN" --non-interactive --agree-tos --email "$LE_EMAIL" --redirect; then
         log_success "SSL certificate obtained successfully"
     else
         log_error "Failed to obtain SSL certificate"
-        exit 1
+        log_info "Trying alternative method..."
+        # Alternative method
+        $SUDO certbot certonly --nginx -d "$FULL_DOMAIN" --non-interactive --agree-tos --email "$LE_EMAIL"
     fi
 }
 
