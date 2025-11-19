@@ -251,6 +251,77 @@ obtain_ssl() {
     fi
 }
 
+# Setup application forwarding
+setup_app_forwarding() {
+    echo
+    log_info "Application Forwarding Setup"
+    echo "================================"
+    
+    read -p "Do you want to forward traffic to a local application? (y/n): " FORWARD_APP
+    
+    if [[ $FORWARD_APP =~ ^[Yy]$ ]]; then
+        while true; do
+            read -p "Enter application port (e.g., 5650): " APP_PORT
+            if [[ $APP_PORT =~ ^[0-9]+$ ]] && [ $APP_PORT -ge 1 ] && [ $APP_PORT -le 65535 ]; then
+                break
+            else
+                log_error "Please enter a valid port number (1-65535)"
+            fi
+        done
+        
+        read -p "Enter application host (default: 127.0.0.1): " APP_HOST
+        APP_HOST=${APP_HOST:-127.0.0.1}
+        
+        log_info "Setting up forwarding from https://$FULL_DOMAIN to $APP_HOST:$APP_PORT"
+        
+        # Update nginx configuration to include proxy pass
+        $SUDO tee -a "/etc/nginx/sites-available/$FULL_DOMAIN" > /dev/null <<EOF
+
+# Application proxy configuration
+server {
+    listen 443 ssl;
+    server_name $FULL_DOMAIN;
+    
+    ssl_certificate /etc/letsencrypt/live/$FULL_DOMAIN/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/$FULL_DOMAIN/privkey.pem;
+    
+    location / {
+        proxy_pass http://$APP_HOST:$APP_PORT;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        
+        # WebSocket support
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+    }
+}
+EOF
+        
+        # Test nginx configuration
+        log_info "Testing updated Nginx configuration..."
+        if ! $SUDO nginx -t; then
+            log_error "Nginx configuration test failed after adding proxy"
+            exit 1
+        fi
+        
+        # Reload nginx
+        $SUDO systemctl reload nginx
+        log_success "Application forwarding configured"
+        log_info "All traffic to https://$FULL_DOMAIN will be forwarded to $APP_HOST:$APP_PORT"
+        
+        # Show example command to run the application
+        echo
+        log_info "Example command to run your application:"
+        echo "  python3 app.py  # Make sure it binds to $APP_HOST:$APP_PORT"
+        
+    else
+        log_info "Skipping application forwarding setup"
+    fi
+}
+
 # Setup auto-renewal
 setup_auto_renewal() {
     log_info "Setting up auto-renewal..."
@@ -312,6 +383,7 @@ main() {
     validate_dns
     setup_nginx
     obtain_ssl
+    setup_app_forwarding
     setup_auto_renewal
     final_verification
 }
