@@ -1,46 +1,80 @@
 #!/bin/bash
 
+# Color definitions
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
-NC='\033[0m'
+CYAN='\033[0;36m'
+MAGENTA='\033[0;35m'
+NC='\033[0m' # No Color
 
+# ASCII Art Banner
+show_banner() {
+    clear
+    cat << "EOF"
+    ╔══════════════════════════════════════════════════════════╗
+    ║      ███████╗███████╗██╗         ███████╗███████╗██████╗ ║
+    ║      ██╔════╝██╔════╝██║         ██╔════╝██╔════╝██╔══██╗║
+    ║      ███████╗█████╗  ██║         ███████╗█████╗  ██████╔╝║
+    ║      ╚════██║██╔══╝  ██║         ╚════██║██╔══╝  ██╔══██╗║
+    ║      ███████║███████╗███████╗    ███████║███████╗██║  ██║║
+    ║      ╚══════╝╚══════╝╚══════╝    ╚══════╝╚══════╝╚═╝  ╚═╝║
+    ║                    Nginx SSL Setup Tool                   ║
+    ╚══════════════════════════════════════════════════════════╝
+EOF
+    echo -e "${CYAN}Version 2.0 | Professional SSL Configuration Tool${NC}\n"
+}
+
+# Enhanced logging functions
 log_info() {
-    echo -e "${BLUE}[INFO]${NC} $1"
+    echo -e "${BLUE}ℹ  [INFO]${NC} $1"
 }
 
 log_success() {
-    echo -e "${GREEN}[SUCCESS]${NC} $1"
+    echo -e "${GREEN}✓  [SUCCESS]${NC} $1"
 }
 
 log_warning() {
-    echo -e "${YELLOW}[WARNING]${NC} $1"
+    echo -e "${YELLOW}⚠  [WARNING]${NC} $1"
 }
 
 log_error() {
-    echo -e "${RED}[ERROR]${NC} $1"
+    echo -e "${RED}✗  [ERROR]${NC} $1"
 }
 
+log_step() {
+    echo -e "\n${MAGENTA}▶  [STEP]${NC} $1"
+    echo "────────────────────────────────────────────────────────────"
+}
+
+# Check if script has root privileges
 check_privileges() {
     if [[ $EUID -eq 0 ]]; then
         SUDO=""
+        log_info "Running with root privileges"
     else
         if sudo -n true 2>/dev/null; then
             SUDO="sudo"
+            log_info "Using sudo for privileged commands"
         else
             log_error "This script requires root privileges for SSL setup"
-            log_info "Please run with: sudo bash ssl-setup.sh"
+            echo -e "\n${YELLOW}Please run with:${NC}"
+            echo "  sudo bash $0"
             exit 1
         fi
     fi
 }
 
+# Detect operating system
 detect_os() {
+    log_step "Detecting Operating System"
+    
     if [[ -f /etc/os-release ]]; then
         . /etc/os-release
         OS=$NAME
         OS_VERSION=$VERSION_ID
+        log_info "Detected: $OS $OS_VERSION"
     else
         log_error "Cannot detect OS"
         exit 1
@@ -61,23 +95,35 @@ detect_os() {
             exit 1
             ;;
     esac
+    
+    log_info "Package manager: $PKG_MANAGER"
 }
 
+# Update system packages
 update_packages() {
-    log_info "Updating package lists..."
+    log_step "Updating System Packages"
+    
     case $PKG_MANAGER in
         apt)
-            $SUDO apt update -y
+            $SUDO apt update -y && $SUDO apt upgrade -y
             ;;
         yum|dnf)
             $SUDO $PKG_MANAGER update -y
             ;;
     esac
+    
+    if [ $? -eq 0 ]; then
+        log_success "System packages updated successfully"
+    else
+        log_warning "Package update completed with warnings"
+    fi
 }
 
+# Install required dependencies
 install_dependencies() {
-    log_info "Installing dependencies..."
+    log_step "Installing Required Dependencies"
     
+    # Check and install Nginx
     if ! command -v nginx &> /dev/null; then
         log_info "Installing Nginx..."
         case $PKG_MANAGER in
@@ -88,12 +134,20 @@ install_dependencies() {
                 $SUDO $PKG_MANAGER install -y nginx
                 ;;
         esac
-        $SUDO systemctl enable nginx
-        $SUDO systemctl start nginx
+        
+        if [ $? -eq 0 ]; then
+            $SUDO systemctl enable nginx
+            $SUDO systemctl start nginx
+            log_success "Nginx installed and started"
+        else
+            log_error "Failed to install Nginx"
+            exit 1
+        fi
     else
         log_info "Nginx is already installed"
     fi
 
+    # Check and install Certbot
     if ! command -v certbot &> /dev/null; then
         log_info "Installing Certbot..."
         case $PKG_MANAGER in
@@ -101,340 +155,611 @@ install_dependencies() {
                 $SUDO apt install -y certbot python3-certbot-nginx
                 ;;
             yum|dnf)
-                $SUDO $PKG_MANAGER install -y certbot python3-certbot-nginx
+                if [[ "$ID" == "fedora" ]]; then
+                    $SUDO dnf install -y certbot python3-certbot-nginx
+                else
+                    $SUDO yum install -y epel-release
+                    $SUDO yum install -y certbot python3-certbot-nginx
+                fi
                 ;;
         esac
+        
+        if [ $? -eq 0 ]; then
+            log_success "Certbot installed successfully"
+        else
+            log_error "Failed to install Certbot"
+            exit 1
+        fi
     else
         log_info "Certbot is already installed"
     fi
 
+    # Install additional tools
+    log_info "Installing additional tools..."
     case $PKG_MANAGER in
         apt)
-            $SUDO apt install -y curl dnsutils
+            $SUDO apt install -y curl dnsutils net-tools
             ;;
         yum|dnf)
-            $SUDO $PKG_MANAGER install -y curl bind-utils
+            $SUDO $PKG_MANAGER install -y curl bind-utils net-tools
             ;;
     esac
 }
 
+# Get user input for domain setup
 get_user_input() {
-    echo
-    log_info "SSL Certificate Setup for Nginx"
-    echo "======================================"
+    log_step "Domain Configuration"
+    
+    echo -e "${CYAN}┌────────────────────────────────────────────────────────────┐${NC}"
+    echo -e "${CYAN}│                  Domain Setup Options                     │${NC}"
+    echo -e "${CYAN}└────────────────────────────────────────────────────────────┘${NC}"
+    echo ""
+    
+    # Domain option selection
+    echo -e "${YELLOW}Select domain type:${NC}"
+    echo "  1) Full domain (example.com)"
+    echo "  2) Subdomain (sub.example.com)"
+    echo -e "  3) Wildcard domain (*.example.com) ${YELLOW}(requires DNS validation)${NC}"
+    echo ""
     
     while true; do
-        read -p "Enter subdomain (e.g., bot): " SUBDOMAIN
-        if [[ -n "$SUBDOMAIN" ]]; then
-            break
-        else
-            log_error "Subdomain cannot be empty"
-        fi
+        read -p "Enter choice [1-3]: " DOMAIN_CHOICE
+        case $DOMAIN_CHOICE in
+            1)
+                while true; do
+                    read -p "Enter domain (e.g., example.com): " DOMAIN
+                    if [[ -n "$DOMAIN" && "$DOMAIN" =~ ^[a-zA-Z0-9][a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$ ]]; then
+                        FULL_DOMAIN="$DOMAIN"
+                        break
+                    else
+                        log_error "Invalid domain format. Please enter like: example.com"
+                    fi
+                done
+                break
+                ;;
+            2)
+                while true; do
+                    read -p "Enter subdomain (e.g., blog): " SUBDOMAIN
+                    if [[ -n "$SUBDOMAIN" && "$SUBDOMAIN" =~ ^[a-zA-Z0-9][a-zA-Z0-9.-]*$ ]]; then
+                        break
+                    else
+                        log_error "Invalid subdomain format"
+                    fi
+                done
+                
+                while true; do
+                    read -p "Enter domain (e.g., example.com): " DOMAIN
+                    if [[ -n "$DOMAIN" && "$DOMAIN" =~ ^[a-zA-Z0-9][a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$ ]]; then
+                        FULL_DOMAIN="$SUBDOMAIN.$DOMAIN"
+                        break
+                    else
+                        log_error "Invalid domain format"
+                    fi
+                done
+                break
+                ;;
+            3)
+                log_warning "Wildcard certificates require DNS validation method"
+                log_info "You'll need to manually add TXT records when prompted by Certbot"
+                while true; do
+                    read -p "Enter domain for wildcard (e.g., example.com): " DOMAIN
+                    if [[ -n "$DOMAIN" && "$DOMAIN" =~ ^[a-zA-Z0-9][a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$ ]]; then
+                        FULL_DOMAIN="$DOMAIN"
+                        WILDCARD=true
+                        break
+                    else
+                        log_error "Invalid domain format"
+                    fi
+                done
+                break
+                ;;
+            *)
+                log_error "Invalid choice. Please enter 1, 2, or 3"
+                ;;
+        esac
     done
-
-    while true; do
-        read -p "Enter domain (e.g., godsetta.org): " DOMAIN
-        if [[ -n "$DOMAIN" ]]; then
-            break
-        else
-            log_error "Domain cannot be empty"
-        fi
-    done
-
-    FULL_DOMAIN="$SUBDOMAIN.$DOMAIN"
+    
     log_info "Target domain: $FULL_DOMAIN"
+    
+    # Ask for admin email
+    echo ""
+    read -p "Enter admin email for SSL notifications [admin@$DOMAIN]: " LE_EMAIL
+    LE_EMAIL=${LE_EMAIL:-admin@$DOMAIN}
 }
 
+# Validate DNS configuration
 validate_dns() {
-    log_info "Validating DNS for $FULL_DOMAIN..."
+    log_step "DNS Validation"
     
+    log_info "Checking DNS for $FULL_DOMAIN..."
+    
+    # Function to get public IP
     get_public_ip() {
-        local services=(
+        local ip_services=(
+            "https://api.ipify.org"
             "https://icanhazip.com"
-            "https://ifconfig.me"
-            "https://ipinfo.io/ip"
             "https://checkip.amazonaws.com"
-            "https://ipecho.net/plain"
+            "https://ifconfig.me/ip"
         )
         
-        for service in "${services[@]}"; do
+        for service in "${ip_services[@]}"; do
             local ip=$(curl -s -4 --max-time 5 "$service" 2>/dev/null | tr -d '[:space:]')
             if [[ $ip =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
                 echo "$ip"
                 return 0
             fi
-            sleep 0.5
         done
-        
-        local ip=$(curl -s -4 --max-time 10 "https://ifconfig.co" 2>/dev/null | tr -d '[:space:]')
-        if [[ $ip =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
-            echo "$ip"
-            return 0
-        fi
         
         return 1
     }
     
+    # Get server IP
     SERVER_IP=$(get_public_ip)
     
     if [[ -z "$SERVER_IP" ]]; then
-        local ipwho=$(curl -s -4 "https://ipwho.is/")
-        SERVER_IP=$(echo "$ipwho" | grep -o '"ip":"[^"]*"' | cut -d'"' -f4)
-        if [[ -z "$SERVER_IP" ]]; then
-            log_error "Cannot determine server IP"
-            log_info "Please manually enter your server IP:"
-            read -p "Server IP: " SERVER_IP
+        # Try alternative method
+        SERVER_IP=$(curl -s -4 --max-time 10 "https://ifconfig.co" 2>/dev/null | tr -d '[:space:]')
+    fi
+    
+    if [[ -z "$SERVER_IP" ]]; then
+        log_error "Cannot determine server public IP"
+        read -p "Please enter server IP manually: " SERVER_IP
+        if [[ ! $SERVER_IP =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
+            log_error "Invalid IP address format"
+            exit 1
         fi
     fi
     
     log_info "Server public IP: $SERVER_IP"
     
-    DNS_IP=$(nslookup "$FULL_DOMAIN" | grep -A1 "Name:" | grep "Address:" | awk '{print $2}' | head -n1)
+    # Check DNS resolution
+    DNS_IP=$(dig +short A "$FULL_DOMAIN" | head -n1)
     
     if [[ -z "$DNS_IP" ]]; then
-        log_error "Cannot resolve $FULL_DOMAIN"
-        log_warning "Please make sure your DNS is configured correctly:"
-        echo "  $FULL_DOMAIN A $SERVER_IP"
-        exit 1
+        # Try nslookup as fallback
+        DNS_IP=$(nslookup "$FULL_DOMAIN" 2>/dev/null | grep -A1 "Name:" | grep "Address:" | awk '{print $2}' | head -n1)
     fi
     
-    log_info "DNS resolved IP: $DNS_IP"
-    
-    if [[ "$DNS_IP" != "$SERVER_IP" ]]; then
-        log_error "DNS IP ($DNS_IP) does not match server IP ($SERVER_IP)"
-        log_warning "Please update your DNS records:"
-        echo "  $FULL_DOMAIN A $SERVER_IP"
-        exit 1
+    if [[ -z "$DNS_IP" ]]; then
+        log_warning "Cannot resolve $FULL_DOMAIN"
+        echo -e "\n${YELLOW}DNS Configuration Required:${NC}"
+        echo "────────────────────────────────"
+        echo "Please add this DNS record in your domain control panel:"
+        echo ""
+        echo -e "${CYAN}Type:${NC} A"
+        echo -e "${CYAN}Name:${NC} ${FULL_DOMAIN}"
+        echo -e "${CYAN}Value:${NC} ${SERVER_IP}"
+        echo -e "${CYAN}TTL:${NC} 3600"
+        echo ""
+        
+        if [[ "$WILDCARD" == "true" ]]; then
+            echo -e "${YELLOW}For wildcard certificate, you'll also need:${NC}"
+            echo "Type: TXT"
+            echo "Name: _acme-challenge.${FULL_DOMAIN}"
+            echo "Value: [Will be provided by Certbot]"
+        fi
+        
+        read -p "Press Enter when DNS is configured, or 's' to skip DNS check: " SKIP_DNS
+        if [[ "$SKIP_DNS" != "s" ]]; then
+            log_info "Waiting 30 seconds for DNS propagation..."
+            sleep 30
+            DNS_IP=$(dig +short A "$FULL_DOMAIN" | head -n1)
+        fi
     fi
     
-    log_success "DNS validation passed"
+    if [[ -n "$DNS_IP" ]]; then
+        log_info "DNS resolved IP: $DNS_IP"
+        
+        if [[ "$DNS_IP" == "$SERVER_IP" ]]; then
+            log_success "DNS validation passed"
+        else
+            log_warning "DNS IP ($DNS_IP) doesn't match server IP ($SERVER_IP)"
+            echo -e "\n${YELLOW}Please update your DNS A record:${NC}"
+            echo "$FULL_DOMAIN → $SERVER_IP"
+            read -p "Continue anyway? (y/n): " CONTINUE
+            if [[ ! $CONTINUE =~ ^[Yy]$ ]]; then
+                exit 1
+            fi
+        fi
+    else
+        log_warning "Skipping DNS validation"
+    fi
 }
 
+# Setup initial Nginx configuration for SSL challenge
 setup_nginx_initial() {
-    log_info "Setting up initial Nginx configuration for SSL challenge..."
+    log_step "Configuring Nginx for SSL"
     
+    # Create necessary directories
+    $SUDO mkdir -p /var/www/html/.well-known/acme-challenge
+    
+    # Backup existing config if it exists
     NGINX_CONF="/etc/nginx/sites-available/$FULL_DOMAIN"
+    if [[ -f "$NGINX_CONF" ]]; then
+        $SUDO cp "$NGINX_CONF" "$NGINX_CONF.backup.$(date +%Y%m%d_%H%M%S)"
+        log_info "Backed up existing configuration"
+    fi
     
+    # Create initial Nginx configuration
     $SUDO tee "$NGINX_CONF" > /dev/null <<EOF
+# Initial configuration for SSL certificate validation
 server {
     listen 80;
     server_name $FULL_DOMAIN;
     
+    # Let's Encrypt challenge directory
     location /.well-known/acme-challenge/ {
         root /var/www/html;
+        allow all;
     }
     
+    # Redirect all other traffic to HTTPS (will be active after SSL)
     location / {
         return 301 https://\$server_name\$request_uri;
     }
 }
 EOF
-
+    
+    # Enable site
     if [[ ! -f "/etc/nginx/sites-enabled/$FULL_DOMAIN" ]]; then
-        $SUDO ln -s "$NGINX_CONF" "/etc/nginx/sites-enabled/"
+        $SUDO ln -sf "$NGINX_CONF" "/etc/nginx/sites-enabled/"
     fi
     
+    # Test Nginx configuration
     log_info "Testing Nginx configuration..."
-    if ! $SUDO nginx -t; then
+    if $SUDO nginx -t; then
+        $SUDO systemctl reload nginx
+        log_success "Nginx configuration applied successfully"
+    else
         log_error "Nginx configuration test failed"
         exit 1
     fi
-    
-    $SUDO systemctl reload nginx
-    log_success "Initial Nginx configuration applied"
 }
 
+# Obtain SSL certificate from Let's Encrypt
 obtain_ssl() {
-    log_info "Obtaining SSL certificate for $FULL_DOMAIN..."
+    log_step "Obtaining SSL Certificate"
     
-    LE_EMAIL="admin@$DOMAIN"
-    
-    if $SUDO certbot --nginx -d "$FULL_DOMAIN" --non-interactive --agree-tos --email "$LE_EMAIL" --redirect; then
-        log_success "SSL certificate obtained successfully"
-    else
-        log_error "Failed to obtain SSL certificate"
-        log_info "Trying alternative method..."
-        if $SUDO certbot certonly --nginx -d "$FULL_DOMAIN" --non-interactive --agree-tos --email "$LE_EMAIL"; then
-            log_success "SSL certificate obtained via certonly"
+    if [[ "$WILDCARD" == "true" ]]; then
+        log_info "Requesting wildcard certificate for *.$FULL_DOMAIN"
+        log_warning "This requires DNS validation with TXT records"
+        echo ""
+        if $SUDO certbot certonly --manual \
+            --preferred-challenges=dns \
+            --manual-public-ip-logging-ok \
+            -d "*.$FULL_DOMAIN" \
+            -d "$FULL_DOMAIN" \
+            --non-interactive \
+            --agree-tos \
+            --email "$LE_EMAIL"; then
+            log_success "Wildcard SSL certificate obtained successfully"
         else
-            log_error "Failed to obtain SSL certificate completely"
+            log_error "Failed to obtain wildcard certificate"
+            log_info "You may need to manually add TXT DNS records"
             exit 1
+        fi
+    else
+        log_info "Requesting SSL certificate for $FULL_DOMAIN"
+        
+        # Try with --nginx plugin first
+        if $SUDO certbot --nginx \
+            -d "$FULL_DOMAIN" \
+            --non-interactive \
+            --agree-tos \
+            --email "$LE_EMAIL" \
+            --redirect \
+            --hsts; then
+            log_success "SSL certificate obtained and configured successfully"
+        else
+            log_warning "Certbot with nginx plugin failed, trying standalone method..."
+            
+            # Stop nginx temporarily for standalone mode
+            $SUDO systemctl stop nginx
+            
+            if $SUDO certbot certonly --standalone \
+                -d "$FULL_DOMAIN" \
+                --non-interactive \
+                --agree-tos \
+                --email "$LE_EMAIL"; then
+                log_success "SSL certificate obtained via standalone method"
+            else
+                log_error "Failed to obtain SSL certificate"
+                $SUDO systemctl start nginx
+                exit 1
+            fi
+            
+            # Restart nginx
+            $SUDO systemctl start nginx
         fi
     fi
 }
 
+# Setup application forwarding
 setup_app_forwarding() {
-    echo
-    log_info "Application Forwarding Setup"
-    echo "================================"
+    log_step "Application Configuration"
     
-    read -p "Do you want to forward traffic to a local application? (y/n): " FORWARD_APP
+    echo -e "\n${CYAN}┌────────────────────────────────────────────────────────────┐${NC}"
+    echo -e "${CYAN}│                Application Forwarding                    │${NC}"
+    echo -e "${CYAN}└────────────────────────────────────────────────────────────┘${NC}"
+    
+    read -p "Do you want to forward HTTPS traffic to a local application? (y/n): " FORWARD_APP
     
     if [[ $FORWARD_APP =~ ^[Yy]$ ]]; then
+        # Get application details
+        echo ""
+        log_info "Enter application details:"
+        
         while true; do
-            read -p "Enter application port (e.g., 5650): " APP_PORT
+            read -p "Application port (e.g., 3000, 8080, 5650): " APP_PORT
             if [[ $APP_PORT =~ ^[0-9]+$ ]] && [ $APP_PORT -ge 1 ] && [ $APP_PORT -le 65535 ]; then
                 break
             else
-                log_error "Please enter a valid port number (1-65535)"
+                log_error "Invalid port number. Must be between 1 and 65535"
             fi
         done
         
-        read -p "Enter application host (default: 127.0.0.1): " APP_HOST
+        read -p "Application host/IP [127.0.0.1]: " APP_HOST
         APP_HOST=${APP_HOST:-127.0.0.1}
         
-        log_info "Setting up forwarding from https://$FULL_DOMAIN to $APP_HOST:$APP_PORT"
+        read -p "Application protocol (http/https/ws) [http]: " APP_PROTOCOL
+        APP_PROTOCOL=${APP_PROTOCOL:-http}
         
+        # Create comprehensive Nginx configuration
         $SUDO tee "/etc/nginx/sites-available/$FULL_DOMAIN" > /dev/null <<EOF
+# SSL Configuration for $FULL_DOMAIN
+# Generated on $(date)
+# Certificate: /etc/letsencrypt/live/$FULL_DOMAIN/
+
+# HTTP to HTTPS redirect
 server {
     listen 80;
+    listen [::]:80;
     server_name $FULL_DOMAIN;
     
+    # ACME challenge location
     location /.well-known/acme-challenge/ {
         root /var/www/html;
+        allow all;
     }
     
+    # Redirect everything else to HTTPS
     location / {
         return 301 https://\$server_name\$request_uri;
     }
+    
+    access_log /var/log/nginx/${FULL_DOMAIN}_access.log;
+    error_log /var/log/nginx/${FULL_DOMAIN}_error.log;
 }
 
+# HTTPS server
 server {
     listen 443 ssl http2;
+    listen [::]:443 ssl http2;
     server_name $FULL_DOMAIN;
     
+    # SSL certificate paths
     ssl_certificate /etc/letsencrypt/live/$FULL_DOMAIN/fullchain.pem;
     ssl_certificate_key /etc/letsencrypt/live/$FULL_DOMAIN/privkey.pem;
     
+    # SSL security settings
     ssl_protocols TLSv1.2 TLSv1.3;
-    ssl_ciphers ECDHE-RSA-AES256-GCM-SHA512:DHE-RSA-AES256-GCM-SHA512:ECDHE-RSA-AES256-GCM-SHA384:DHE-RSA-AES256-GCM-SHA384;
+    ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384;
     ssl_prefer_server_ciphers off;
     ssl_session_cache shared:SSL:10m;
     ssl_session_timeout 10m;
+    ssl_stapling on;
+    ssl_stapling_verify on;
     
-    add_header X-Frame-Options DENY;
-    add_header X-Content-Type-Options nosniff;
-    add_header X-XSS-Protection "1; mode=block";
+    # Security headers
+    add_header Strict-Transport-Security "max-age=63072000; includeSubDomains; preload" always;
+    add_header X-Frame-Options DENY always;
+    add_header X-Content-Type-Options nosniff always;
+    add_header X-XSS-Protection "1; mode=block" always;
+    add_header Referrer-Policy "strict-origin-when-cross-origin" always;
     
+    # Root location (can be used for static files)
     location / {
-        proxy_pass http://$APP_HOST:$APP_PORT;
+        # Uncomment for static file serving:
+        # root /var/www/html;
+        # index index.html;
+        
+        # Reverse proxy configuration
+        proxy_pass ${APP_PROTOCOL}://${APP_HOST}:${APP_PORT};
+        
+        # Proxy headers
         proxy_set_header Host \$host;
         proxy_set_header X-Real-IP \$remote_addr;
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto \$scheme;
         proxy_set_header X-Forwarded-Host \$host;
+        proxy_set_header X-Forwarded-Port \$server_port;
         
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection "upgrade";
-        
+        # Timeouts
         proxy_connect_timeout 60s;
         proxy_send_timeout 60s;
         proxy_read_timeout 60s;
+        
+        # WebSocket support
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
     }
     
+    # Block access to hidden files
     location ~ /\. {
         deny all;
         access_log off;
         log_not_found off;
     }
+    
+    # Security: deny access to sensitive files
+    location ~ /(\.git|\.env|\.htaccess|\.htpasswd) {
+        deny all;
+        access_log off;
+        log_not_found off;
+    }
+    
+    # Optional: Add specific API or static file locations here
+    # location /api/ {
+    #     proxy_pass http://127.0.0.1:8000;
+    # }
+    
+    # location /static/ {
+    #     root /var/www/static;
+    #     expires 1y;
+    #     add_header Cache-Control "public, immutable";
+    # }
+    
+    access_log /var/log/nginx/${FULL_DOMAIN}_ssl_access.log;
+    error_log /var/log/nginx/${FULL_DOMAIN}_ssl_error.log;
 }
 EOF
         
+        # Test configuration
         log_info "Testing updated Nginx configuration..."
-        if ! $SUDO nginx -t; then
-            log_error "Nginx configuration test failed after adding proxy"
-            $SUDO nginx -T | grep -A 50 "server_name $FULL_DOMAIN" || true
+        if $SUDO nginx -t; then
+            $SUDO systemctl reload nginx
+            log_success "Application forwarding configured successfully"
+            echo ""
+            echo -e "${GREEN}✓ Forwarding configured:${NC}"
+            echo "  https://$FULL_DOMAIN → ${APP_PROTOCOL}://${APP_HOST}:${APP_PORT}"
+        else
+            log_error "Nginx configuration test failed"
             exit 1
         fi
-        
-        $SUDO systemctl reload nginx
-        log_success "Application forwarding configured"
-        log_info "All traffic to https://$FULL_DOMAIN will be forwarded to $APP_HOST:$APP_PORT"
-        
-        echo
-        log_info "Example command to run your application:"
-        echo "  python3 app.py"
-        echo
-        log_warning "IMPORTANT: Make sure your Flask app is running and accessible at http://$APP_HOST:$APP_PORT"
-        
     else
         log_info "Skipping application forwarding setup"
+        log_info "You can manually edit /etc/nginx/sites-available/$FULL_DOMAIN later"
     fi
 }
 
+# Setup automatic certificate renewal
 setup_auto_renewal() {
-    log_info "Setting up auto-renewal..."
+    log_step "Configuring Auto-Renewal"
     
+    # Test renewal process
+    log_info "Testing certificate renewal..."
     if $SUDO certbot renew --dry-run; then
-        log_success "Auto-renewal test successful"
+        log_success "Auto-renewal test passed"
     else
-        log_warning "Auto-renewal test failed, but continuing"
+        log_warning "Auto-renewal test failed. Manual renewal may be required"
     fi
     
-    CRON_JOB="0 12 * * * /usr/bin/certbot renew --quiet"
-    if ! $SUDO crontab -l 2>/dev/null | grep -q "certbot renew"; then
-        ($SUDO crontab -l 2>/dev/null; echo "$CRON_JOB") | $SUDO crontab -
+    # Add cron job if not exists
+    CRON_JOB="0 12 * * * /usr/bin/certbot renew --quiet --post-hook \"systemctl reload nginx\""
+    if ! crontab -l 2>/dev/null | grep -q "certbot renew"; then
+        (crontab -l 2>/dev/null; echo "$CRON_JOB") | crontab -
         log_success "Auto-renewal cron job added"
     else
         log_info "Auto-renewal cron job already exists"
     fi
+    
+    # Add renewal hook for nginx reload
+    $SUDO mkdir -p /etc/letsencrypt/renewal-hooks/post
+    $SUDO tee /etc/letsencrypt/renewal-hooks/post/reload-nginx.sh > /dev/null <<EOF
+#!/bin/bash
+systemctl reload nginx
+EOF
+    $SUDO chmod +x /etc/letsencrypt/renewal-hooks/post/reload-nginx.sh
 }
 
-debug_configuration() {
-    log_info "Debugging current configuration..."
-    
-    echo
-    log_info "Current Nginx configuration for $FULL_DOMAIN:"
-    echo "=================================================="
-    $SUDO nginx -T | grep -A 30 "server_name $FULL_DOMAIN" || log_warning "No configuration found for $FULL_DOMAIN"
-    
-    echo
-    log_info "Checking if certificate exists:"
-    $SUDO certbot certificates | grep -A 10 "$FULL_DOMAIN" || log_warning "No certificate found for $FULL_DOMAIN"
-    
-    echo
-    log_info "Testing HTTPS connection:"
-    if curl -s -I "https://$FULL_DOMAIN" --max-time 10 | head -n 5; then
-        log_success "HTTPS connection successful"
-    else
-        log_warning "HTTPS connection test failed or timed out"
-    fi
-}
-
+# Final verification and summary
 final_verification() {
-    log_info "Performing final verification..."
+    log_step "Final Verification"
     
-    if $SUDO certbot certificates | grep -q "$FULL_DOMAIN"; then
-        log_success "SSL certificate verified"
+    echo -e "\n${CYAN}┌────────────────────────────────────────────────────────────┐${NC}"
+    echo -e "${CYAN}│                    Verification Results                   │${NC}"
+    echo -e "${CYAN}└────────────────────────────────────────────────────────────┘${NC}"
+    
+    # Check certificate status
+    log_info "Certificate status:"
+    if $SUDO certbot certificates | grep -A 3 "$FULL_DOMAIN"; then
+        log_success "✓ SSL certificate is valid"
     else
-        log_error "SSL certificate verification failed"
-        exit 1
+        log_error "✗ SSL certificate not found"
     fi
     
-    log_info "Testing HTTPS access to $FULL_DOMAIN..."
-    RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" "https://$FULL_DOMAIN" --max-time 10)
-    
-    if [[ "$RESPONSE" =~ ^[23][0-9][0-9]$ ]]; then
-        log_success "HTTPS is working correctly (HTTP $RESPONSE)"
+    # Check Nginx configuration
+    log_info "\nNginx configuration:"
+    if $SUDO nginx -t 2>&1 | grep -q "successful"; then
+        log_success "✓ Nginx configuration is valid"
     else
-        log_warning "HTTPS returned HTTP $RESPONSE - this might be normal if your app isn't running yet"
+        log_error "✗ Nginx configuration has errors"
     fi
     
-    echo
-    log_success "🎉 SSL setup completed successfully!"
-    log_info "Your domain https://$FULL_DOMAIN is now secured with SSL"
-    echo
-    log_info "Certificate location: /etc/letsencrypt/live/$FULL_DOMAIN/"
-    log_info "Nginx config: /etc/nginx/sites-available/$FULL_DOMAIN"
+    # Test HTTPS connection
+    log_info "\nTesting HTTPS connection..."
+    echo -e "${YELLOW}Attempting to connect to https://$FULL_DOMAIN ...${NC}"
     
-    debug_configuration
+    RESPONSE=$(curl -s -o /dev/null -w "%{http_code}\n%{time_total}" "https://$FULL_DOMAIN" --max-time 10 2>/dev/null || echo "000")
+    HTTP_CODE=$(echo "$RESPONSE" | head -n1)
+    RESPONSE_TIME=$(echo "$RESPONSE" | tail -n1)
+    
+    if [[ "$HTTP_CODE" =~ ^[23][0-9][0-9]$ ]]; then
+        log_success "✓ HTTPS connection successful (HTTP $HTTP_CODE, ${RESPONSE_TIME}s)"
+    elif [[ "$HTTP_CODE" == "000" ]]; then
+        log_warning "⚠ Could not connect (service may not be running)"
+    else
+        log_warning "⚠ HTTPS returned HTTP $HTTP_CODE"
+    fi
+    
+    # Display summary
+    echo -e "\n${GREEN}════════════════════════════════════════════════════════════${NC}"
+    echo -e "${GREEN}                 SETUP COMPLETED SUCCESSFULLY                ${NC}"
+    echo -e "${GREEN}════════════════════════════════════════════════════════════${NC}"
+    echo ""
+    echo -e "${CYAN}┌────────────────────────────────────────────────────────────┐${NC}"
+    echo -e "${CYAN}│                        Summary                           │${NC}"
+    echo -e "${CYAN}└────────────────────────────────────────────────────────────┘${NC}"
+    echo ""
+    echo -e "${YELLOW}Domain:${NC}          https://$FULL_DOMAIN"
+    echo -e "${YELLOW}Certificate:${NC}     /etc/letsencrypt/live/$FULL_DOMAIN/"
+    echo -e "${YELLOW}Nginx Config:${NC}    /etc/nginx/sites-available/$FULL_DOMAIN"
+    echo -e "${YELLOW}Logs:${NC}            /var/log/nginx/${FULL_DOMAIN}_*.log"
+    echo ""
+    
+    if [[ $FORWARD_APP =~ ^[Yy]$ ]]; then
+        echo -e "${YELLOW}Forwarding:${NC}      https://$FULL_DOMAIN → ${APP_PROTOCOL}://${APP_HOST}:${APP_PORT}"
+        echo ""
+        echo -e "${CYAN}Application Command Examples:${NC}"
+        echo "  # Python Flask"
+        echo "  python3 app.py"
+        echo ""
+        echo "  # Node.js"
+        echo "  npm start"
+        echo ""
+        echo "  # Run in background"
+        echo "  nohup python3 app.py > app.log 2>&1 &"
+    fi
+    
+    echo -e "${CYAN}Useful Commands:${NC}"
+    echo "  Check certificate: sudo certbot certificates"
+    echo "  Renew certificate: sudo certbot renew"
+    echo "  Test Nginx config: sudo nginx -t"
+    echo "  Reload Nginx:      sudo systemctl reload nginx"
+    echo "  View logs:         sudo tail -f /var/log/nginx/${FULL_DOMAIN}_error.log"
+    echo ""
+    echo -e "${GREEN}✅ SSL setup is complete! Your site is now secured.${NC}"
 }
 
+# Main execution flow
 main() {
-    clear
-    log_info "Starting SSL setup automation..."
+    show_banner
     
+    echo -e "${YELLOW}This script will:${NC}"
+    echo " 1. Install Nginx and Certbot"
+    echo " 2. Configure SSL for your domain"
+    echo " 3. Set up HTTPS redirection"
+    echo " 4. Optionally configure application forwarding"
+    echo ""
+    
+    read -p "Continue with SSL setup? (y/n): " CONFIRM
+    if [[ ! $CONFIRM =~ ^[Yy]$ ]]; then
+        echo "Setup cancelled"
+        exit 0
+    fi
+    
+    # Execute steps
     check_privileges
     detect_os
     update_packages
@@ -448,4 +773,8 @@ main() {
     final_verification
 }
 
+# Trap for clean exit
+trap 'log_error "Script interrupted by user"; exit 1' INT
+
+# Run main function
 main "$@"
