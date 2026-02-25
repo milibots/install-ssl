@@ -1,9 +1,6 @@
 #!/usr/bin/env bash
-set -e
+set -euo pipefail
 
-# =========================
-# 🎨 COLORS & STYLES
-# =========================
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -12,21 +9,36 @@ CYAN='\033[0;36m'
 BOLD='\033[1m'
 NC='\033[0m'
 
-# =========================
-# 🧾 LOG HELPERS
-# =========================
 info()    { echo -e "${BLUE}ℹ${NC}  $1"; }
 success() { echo -e "${GREEN}✔${NC}  $1"; }
 warn()    { echo -e "${YELLOW}⚠${NC}  $1"; }
-error()   { echo -e "${RED}✖${NC}  $1"; }
+error()   { echo -e "${RED}✖${NC}  $1" >&2; }
 
-separator() {
-    echo -e "${CYAN}────────────────────────────────────────────${NC}"
+separator() { echo -e "${CYAN}────────────────────────────────────────────${NC}"; }
+
+retry() {
+    local attempts=$1 delay=$2
+    shift 2
+    local i=1
+    until "$@"; do
+        if (( i >= attempts )); then
+            error "Command failed after $attempts attempts: $*"
+            return 1
+        fi
+        warn "Attempt $i/$attempts failed. Retrying in ${delay}s..."
+        sleep "$delay"
+        (( i++ ))
+    done
 }
 
-# =========================
-# 🎬 BANNER
-# =========================
+cleanup() {
+    local exit_code=$?
+    if (( exit_code != 0 )); then
+        error "Script exited with error (code $exit_code)."
+    fi
+}
+trap cleanup EXIT
+
 clear
 echo -e "${BOLD}${CYAN}"
 cat <<'EOF'
@@ -42,9 +54,6 @@ EOF
 echo -e "${NC}"
 separator
 
-# =========================
-# 🔐 PRIVILEGES CHECK
-# =========================
 if [[ $EUID -ne 0 ]]; then
     if sudo -n true 2>/dev/null; then
         SUDO="sudo"
@@ -56,11 +65,12 @@ else
     SUDO=""
 fi
 
-# =========================
-# 🧠 OS DETECTION & PREP
-# =========================
-source /etc/os-release
+if [[ ! -f /etc/os-release ]]; then
+    error "Cannot detect OS: /etc/os-release not found."
+    exit 1
+fi
 
+source /etc/os-release
 info "Detected OS: $PRETTY_NAME"
 
 PACKAGES=""
@@ -69,7 +79,6 @@ INSTALL_CMD=""
 
 case "$ID" in
     ubuntu|debian|kali|pop|linuxmint)
-        # Ubuntu uses dnsutils, not bind-utils
         PACKAGES="nginx curl certbot python3-certbot-nginx dnsutils"
         UPDATE_CMD="$SUDO apt-get update -y"
         INSTALL_CMD="$SUDO apt-get install -y"
@@ -85,140 +94,154 @@ case "$ID" in
         ;;
 esac
 
-# =========================
-# 📦 INSTALL DEPENDENCIES
-# =========================
 separator
-info "Updating repositories..."
-eval "$UPDATE_CMD" > /dev/null 2>&1
+info "Updating package repositories..."
+if ! retry 3 5 bash -c "$UPDATE_CMD" > /dev/null 2>&1; then
+    warn "Repository update failed, proceeding with cached data..."
+fi
 
-info "Installing dependencies (Nginx, Certbot, DNS Utils)..."
-# We run this verbosely so you can see if errors happen
-$INSTALL_CMD $PACKAGES
-
-# Verify installation
-if ! command -v nginx &> /dev/null; then
-    error "Nginx failed to install."
+info "Installing dependencies..."
+if ! retry 3 10 bash -c "$INSTALL_CMD $PACKAGES"; then
+    error "Failed to install required packages: $PACKAGES"
     exit 1
 fi
 
-if ! command -v certbot &> /dev/null; then
-    error "Certbot failed to install."
+for cmd in nginx certbot; do
+    if ! command -v "$cmd" &>/dev/null; then
+        error "$cmd is not available after installation."
+        exit 1
+    fi
+done
+
+if ! retry 3 5 $SUDO systemctl enable nginx --now > /dev/null 2>&1; then
+    error "Failed to start Nginx."
     exit 1
 fi
 
-# Enable Nginx
-$SUDO systemctl enable nginx --now > /dev/null 2>&1
+success "Dependencies installed & Nginx started."
 
-success "Dependencies installed & Nginx started"
-
-# =========================
-# 🌍 DOMAIN INPUT
-# =========================
 separator
 echo -e "Enter the domain you want to secure."
-echo -e "Examples: ${YELLOW}milud.ir${NC} or ${YELLOW}sub.milud.ir${NC}"
-read -rp "Domain: " RAW_DOMAIN
+echo -e "Examples: ${YELLOW}example.com${NC} or ${YELLOW}sub.example.com${NC}"
 
-# Clean input (remove http://, https://, trailing slashes, and whitespace)
-FULL_DOMAIN=$(echo "$RAW_DOMAIN" | sed -e 's|^[^/]*//||' -e 's|/.*$||' | tr -d ' ')
-
-if [[ -z "$FULL_DOMAIN" ]]; then
-    error "Domain cannot be empty."
-    exit 1
-fi
+while true; do
+    read -rp "Domain: " RAW_DOMAIN
+    FULL_DOMAIN=$(echo "$RAW_DOMAIN" | sed -e 's|^[^/]*//||' -e 's|/.*$||' | tr -d ' ')
+    if [[ -n "$FULL_DOMAIN" ]]; then
+        break
+    fi
+    error "Domain cannot be empty. Please try again."
+done
 
 success "Targeting: $FULL_DOMAIN"
 
-# =========================
-# 🌐 DNS CHECK
-# =========================
 separator
 info "Verifying DNS records..."
 
-# Get Public IP
-SERVER_IP=$(curl -s https://checkip.amazonaws.com | tr -d ' ')
-
-# Resolve Domain IP
-if command -v dig &> /dev/null; then
-    DNS_IP=$(dig +short "$FULL_DOMAIN" A | head -n1)
-else
-    # Fallback if dig fails specifically
-    DNS_IP=$(getent hosts "$FULL_DOMAIN" | awk '{ print $1 }' | head -n1)
-fi
-
-info "Server IP: $SERVER_IP"
-info "Domain IP: ${DNS_IP:-"Not Found"}"
-
-if [[ "$SERVER_IP" != "$DNS_IP" ]]; then
-    warn "DNS MISMATCH DETECTED!"
-    echo -e "The domain ${BOLD}$FULL_DOMAIN${NC} does not point to this server ($SERVER_IP)."
-    echo -e "Current IP points to: ${RED}$DNS_IP${NC}"
-    echo -e "Please update your DNS 'A' record before continuing."
-    
-    read -rp "Ignore warning and proceed anyway? (y/N): " FORCE
-    if [[ ! "$FORCE" =~ ^[Yy]$ ]]; then
-        exit 1
+SERVER_IP=""
+for svc in https://checkip.amazonaws.com https://api.ipify.org https://ifconfig.me; do
+    SERVER_IP=$(curl -s --max-time 5 "$svc" | tr -d '[:space:]') || true
+    if [[ -n "$SERVER_IP" ]]; then
+        break
     fi
+done
+
+if [[ -z "$SERVER_IP" ]]; then
+    warn "Could not determine public IP. Skipping DNS check."
+    DNS_SKIP=1
 else
-    success "DNS is correct."
+    DNS_SKIP=0
 fi
 
-# =========================
-# ⚙️ CLEANUP OLD CONFIGS
-# =========================
-# Remove default config if it exists to prevent conflicts
+if (( DNS_SKIP == 0 )); then
+    DNS_IP=""
+    if command -v dig &>/dev/null; then
+        DNS_IP=$(dig +short +timeout=10 +tries=3 "$FULL_DOMAIN" A | grep -E '^[0-9]+\.' | head -n1) || true
+    fi
+    if [[ -z "$DNS_IP" ]] && command -v getent &>/dev/null; then
+        DNS_IP=$(getent hosts "$FULL_DOMAIN" 2>/dev/null | awk '{print $1}' | head -n1) || true
+    fi
+    if [[ -z "$DNS_IP" ]] && command -v host &>/dev/null; then
+        DNS_IP=$(host -t A "$FULL_DOMAIN" 2>/dev/null | awk '/has address/{print $NF}' | head -n1) || true
+    fi
+
+    info "Server IP : $SERVER_IP"
+    info "Domain IP : ${DNS_IP:-Not Found}"
+
+    if [[ "$SERVER_IP" != "$DNS_IP" ]]; then
+        warn "DNS MISMATCH DETECTED!"
+        echo -e "Domain ${BOLD}$FULL_DOMAIN${NC} does not point to this server (${SERVER_IP})."
+        echo -e "Resolved IP: ${RED}${DNS_IP:-None}${NC}"
+        echo -e "Update your DNS 'A' record before continuing."
+        read -rp "Ignore and proceed anyway? (y/N): " FORCE
+        if [[ ! "$FORCE" =~ ^[Yy]$ ]]; then
+            info "Aborted. Fix DNS and re-run."
+            exit 1
+        fi
+    else
+        success "DNS is correct."
+    fi
+fi
+
 if [[ -f /etc/nginx/sites-enabled/default ]]; then
     $SUDO rm -f /etc/nginx/sites-enabled/default
 fi
 
-# =========================
-# 🔒 REQUEST SSL (CERTBOT)
-# =========================
 separator
-info "Requesting SSL Certificate via Let's Encrypt..."
+info "Requesting SSL certificate via Let's Encrypt..."
 
-# We use Certbot to generate the initial config and cert
-# This handles the temporary Nginx config automatically
-$SUDO certbot --nginx \
-    -d "$FULL_DOMAIN" \
-    --non-interactive \
-    --agree-tos \
-    --register-unsafely-without-email \
-    --redirect
+CERTBOT_SUCCESS=0
+for attempt in 1 2 3; do
+    if $SUDO certbot --nginx \
+        -d "$FULL_DOMAIN" \
+        --non-interactive \
+        --agree-tos \
+        --register-unsafely-without-email \
+        --redirect; then
+        CERTBOT_SUCCESS=1
+        break
+    else
+        warn "Certbot attempt $attempt/3 failed."
+        if (( attempt < 3 )); then
+            info "Waiting 15 seconds before retry..."
+            sleep 15
+        fi
+    fi
+done
 
-if [[ $? -eq 0 ]]; then
-    success "SSL Certificate obtained successfully!"
-else
-    error "Certbot failed. Check your DNS settings and Firewall (Ports 80/443)."
+if (( CERTBOT_SUCCESS == 0 )); then
+    error "Certbot failed after 3 attempts."
+    error "Check: DNS propagation, firewall (ports 80/443 open), and domain ownership."
     exit 1
 fi
 
-# =========================
-# 🔁 PROXY SETUP (OPTIONAL)
-# =========================
+success "SSL Certificate obtained successfully!"
+
 separator
-read -rp "Do you want to forward this domain to a local app/port? (y/n): " PROXY_ASK
+read -rp "Forward this domain to a local app/port? (y/n): " PROXY_ASK
 
 if [[ "$PROXY_ASK" =~ ^[Yy]$ ]]; then
-    read -rp "Enter Local Port (e.g., 3000, 8080): " PORT
-    
-    # Check if port is a number
-    if ! [[ "$PORT" =~ ^[0-9]+$ ]]; then
-        error "Invalid port number."
-        exit 1
-    fi
+    while true; do
+        read -rp "Local port (e.g. 3000, 8080): " PORT
+        if [[ "$PORT" =~ ^[0-9]+$ ]] && (( PORT >= 1 && PORT <= 65535 )); then
+            break
+        fi
+        error "Invalid port. Enter a number between 1 and 65535."
+    done
 
-    CONF_FILE="/etc/nginx/sites-available/$FULL_DOMAIN" # Certbot may have created this, or default
-
-    # If certbot created a specific file name (usually domain.conf or default), we overwrite the HTTPS block
-    # Note: Certbot usually modifies the file directly. We will rewrite it completely for stability.
-    
-    # Define Cert Paths
     CERT_PATH="/etc/letsencrypt/live/$FULL_DOMAIN/fullchain.pem"
     KEY_PATH="/etc/letsencrypt/live/$FULL_DOMAIN/privkey.pem"
 
-$SUDO tee "$CONF_FILE" >/dev/null <<EOF
+    if [[ ! -f "$CERT_PATH" || ! -f "$KEY_PATH" ]]; then
+        error "Certificate files not found at expected paths:"
+        error "  $CERT_PATH"
+        error "  $KEY_PATH"
+        exit 1
+    fi
+
+    CONF_FILE="/etc/nginx/sites-available/$FULL_DOMAIN"
+
+    $SUDO tee "$CONF_FILE" >/dev/null <<EOF
 server {
     listen 80;
     server_name $FULL_DOMAIN;
@@ -226,7 +249,7 @@ server {
 }
 
 server {
-    listen 443 ssl; # http2 is deprecated in newer nginx versions, removed for stability
+    listen 443 ssl;
     server_name $FULL_DOMAIN;
 
     ssl_certificate $CERT_PATH;
@@ -234,37 +257,64 @@ server {
     include /etc/letsencrypt/options-ssl-nginx.conf;
     ssl_dhparam /etc/letsencrypt/ssl-dhparams.pem;
 
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_prefer_server_ciphers on;
+    ssl_session_cache shared:SSL:10m;
+    ssl_session_timeout 1d;
+
+    add_header Strict-Transport-Security "max-age=63072000; includeSubDomains; preload" always;
+    add_header X-Content-Type-Options nosniff always;
+    add_header X-Frame-Options SAMEORIGIN always;
+    add_header X-XSS-Protection "1; mode=block" always;
+
     location / {
         proxy_pass http://127.0.0.1:$PORT;
         proxy_set_header Host \$host;
         proxy_set_header X-Real-IP \$remote_addr;
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto \$scheme;
-        
-        # WebSocket Support
+
         proxy_http_version 1.1;
         proxy_set_header Upgrade \$http_upgrade;
         proxy_set_header Connection "upgrade";
+
+        proxy_connect_timeout 60s;
+        proxy_send_timeout 60s;
+        proxy_read_timeout 60s;
+
+        proxy_buffering on;
+        proxy_buffer_size 128k;
+        proxy_buffers 4 256k;
     }
 }
 EOF
 
-    # Link it just in case
     $SUDO ln -sf "$CONF_FILE" /etc/nginx/sites-enabled/
-    
-    # Reload Nginx
-    $SUDO nginx -t && $SUDO systemctl reload nginx
-    success "Proxy setup complete: https://$FULL_DOMAIN → 127.0.0.1:$PORT"
 
+    if ! $SUDO nginx -t 2>&1; then
+        error "Nginx config test failed. Check $CONF_FILE"
+        exit 1
+    fi
+
+    if ! retry 3 5 $SUDO systemctl reload nginx; then
+        error "Failed to reload Nginx."
+        exit 1
+    fi
+
+    success "Proxy configured: https://$FULL_DOMAIN → 127.0.0.1:$PORT"
 else
-    info "Keeping default Certbot static/redirect configuration."
+    info "Keeping default Certbot configuration."
 fi
 
-# =========================
-# 🎉 FINAL SUMMARY
-# =========================
+CRON_JOB="0 3 * * * /usr/bin/certbot renew --quiet --post-hook 'systemctl reload nginx'"
+if ! ($SUDO crontab -l 2>/dev/null | grep -qF 'certbot renew'); then
+    (($SUDO crontab -l 2>/dev/null; echo "$CRON_JOB") | $SUDO crontab -)
+    success "Auto-renewal cron job added."
+fi
+
 separator
-success "Installation Finished!"
-echo -e "🔐 URL:   https://$FULL_DOMAIN"
-echo -e "📂 Config: /etc/nginx/sites-available/$FULL_DOMAIN"
+success "All done!"
+echo -e "🔐 URL    : https://$FULL_DOMAIN"
+echo -e "📂 Config : /etc/nginx/sites-available/$FULL_DOMAIN"
+echo -e "🔄 Cert   : /etc/letsencrypt/live/$FULL_DOMAIN/"
 separator
