@@ -25,64 +25,55 @@ YELLOW='\033[1;33m'
 CYAN='\033[0;36m'
 NC='\033[0m'
 
-log()     { echo -e "${CYAN}[•]${NC} $1"; }
-success() { echo -e "${GREEN}[✔]${NC} $1"; }
-warn()    { echo -e "${YELLOW}[⚠]${NC} $1"; }
-err()     { echo -e "${RED}[✖]${NC} $1" >&2; }
+log()     { echo -e "${CYAN}[•]${NC} $*"; }
+success() { echo -e "${GREEN}[✔]${NC} $*"; }
+warn()    { echo -e "${YELLOW}[⚠]${NC} $*"; }
+err()     { echo -e "${RED}[✖]${NC} $*" >&2; }
+
+# Always print errors to terminal AND try whiptail
+die() {
+    err "FATAL: $1"
+    whiptail --title "❌ Fatal Error" --msgbox "$(echo -e "$1" | head -20)" 20 70 2>/dev/null || true
+    exit 1
+}
 
 cleanup() {
     local code=$?
     tput cnorm 2>/dev/null || true
-    (( code != 0 )) && err "Script exited with code $code."
+    if (( code != 0 )); then
+        err "-------------------------------------------"
+        err "Script failed with exit code $code"
+        err "Run: sudo nginx -t    to see nginx errors"
+        err "Run: journalctl -xe   to see system errors"
+        err "-------------------------------------------"
+    fi
 }
 trap cleanup EXIT
 
-die() {
-    # Wrap long lines for whiptail display
-    local msg
-    msg=$(echo -e "$1" | fold -s -w 58)
-    whiptail --title "❌ Fatal Error" --msgbox "$msg" 20 64
-    exit 1
-}
-
-nginx_test_or_die() {
-    local out
-    if ! out=$($SUDO nginx -t 2>&1); then
-        die "Nginx config test failed:\n\n$out\n\nFile: $CONF_FILE"
-    fi
-}
-
 retry() {
-    local attempts=$1 delay=$2
-    shift 2
+    local attempts=$1 delay=$2; shift 2
     local i=1
     until "$@"; do
         (( i >= attempts )) && return 1
         warn "Attempt $i/$attempts failed, retrying in ${delay}s..."
-        sleep "$delay"
-        (( i++ ))
+        sleep "$delay"; (( i++ ))
     done
 }
 
-purge_old_nginx_config() {
-    local domain="$1"
-    log "Purging any existing Nginx config for $domain..."
-    $SUDO rm -f "/etc/nginx/sites-enabled/$domain"
-    $SUDO rm -f "/etc/nginx/sites-available/$domain"
-    # Also remove any certbot-named variants
-    $SUDO rm -f "/etc/nginx/sites-enabled/${domain}.conf"
-    $SUDO rm -f "/etc/nginx/sites-available/${domain}.conf"
-    # Remove default if present
-    $SUDO rm -f /etc/nginx/sites-enabled/default
+nginx_test_or_die() {
+    local out
+    out=$($SUDO nginx -t 2>&1) || {
+        err "nginx -t output:"
+        echo "$out" >&2
+        die "Nginx config test FAILED.\n\nnginx -t output:\n$out\n\nFile: $CONF_FILE"
+    }
+    success "nginx -t passed."
 }
 
 # ─── PRIVILEGE CHECK ──────────────────────────────────────────────────────────
 if [[ $EUID -ne 0 ]]; then
-    if sudo -n true 2>/dev/null; then
-        SUDO="sudo"
-    else
-        echo -e "${RED}[✖]${NC} Run as root or with sudo."
-        exit 1
+    if sudo -n true 2>/dev/null; then SUDO="sudo"
+    else err "Run as root or with sudo."; exit 1
     fi
 else
     SUDO=""
@@ -99,20 +90,19 @@ fi
 whiptail --title "🔐 Nginx SSL Setup" --msgbox "\
 ╔══════════════════════════════════════╗
 ║     NGINX + LET'S ENCRYPT TOOL      ║
-║     Automatic SSL Certificate        ║
-║     Setup with Proxy Support         ║
+║     Automatic SSL Setup + Proxy      ║
 ╚══════════════════════════════════════╝
 
 This tool will:
   • Install Nginx + Certbot
   • Verify DNS records
   • Obtain a free SSL certificate
-  • Optionally configure a reverse proxy
+  • Optionally set up a reverse proxy
 
-Press OK to continue." 18 50
+Press OK to continue." 17 50
 
 # ─── OS DETECTION ─────────────────────────────────────────────────────────────
-[[ ! -f /etc/os-release ]] && die "Cannot detect OS: /etc/os-release not found."
+[[ ! -f /etc/os-release ]] && die "Cannot detect OS."
 source /etc/os-release
 
 case "$ID" in
@@ -126,16 +116,14 @@ case "$ID" in
         UPDATE_CMD="$SUDO dnf check-update || true"
         INSTALL_CMD="$SUDO dnf install -y"
         ;;
-    *)
-        die "Unsupported OS: $ID"
-        ;;
+    *) die "Unsupported OS: $ID" ;;
 esac
 
 # ─── INSTALL DEPS ─────────────────────────────────────────────────────────────
 {
-    echo 10; echo "# Updating package repositories..."
+    echo 10; echo "# Updating repositories..."
     bash -c "$UPDATE_CMD" > /dev/null 2>&1 || true
-    echo 40; echo "# Installing Nginx, Certbot, utilities..."
+    echo 40; echo "# Installing packages..."
     bash -c "$INSTALL_CMD $PACKAGES" > /dev/null 2>&1
     echo 80; echo "# Starting Nginx..."
     $SUDO systemctl enable nginx --now > /dev/null 2>&1
@@ -143,20 +131,21 @@ esac
 } | whiptail --title "📦 Installing Dependencies" --gauge "Preparing..." 8 60 0
 
 for cmd in nginx certbot openssl; do
-    command -v "$cmd" &>/dev/null || die "$cmd failed to install.\nCheck your internet connection."
+    command -v "$cmd" &>/dev/null || die "$cmd failed to install."
 done
-success "Dependencies ready."
+success "Dependencies ready. Nginx running."
 
 # ─── DOMAIN INPUT ─────────────────────────────────────────────────────────────
 while true; do
-    RAW_DOMAIN=$(whiptail --title "🌐 Domain Setup" \
-        --inputbox "\nEnter the domain to secure with SSL:\n\nExamples:\n  example.com\n  sub.example.com" \
-        12 55 3>&1 1>&2 2>&3) || { log "Cancelled."; exit 0; }
-
+    RAW_DOMAIN=$(whiptail --title "🌐 Domain" \
+        --inputbox "\nEnter the domain to secure:\n\nExamples:  example.com  /  sub.example.com" \
+        11 55 3>&1 1>&2 2>&3) || { log "Cancelled."; exit 0; }
     FULL_DOMAIN=$(echo "$RAW_DOMAIN" | sed -e 's|^[^/]*//||' -e 's|/.*$||' | tr -d ' ')
     [[ -n "$FULL_DOMAIN" ]] && break
-    whiptail --title "⚠ Invalid" --msgbox "Domain cannot be empty." 8 40
+    whiptail --title "⚠" --msgbox "Domain cannot be empty." 8 36
 done
+
+log "Target domain: $FULL_DOMAIN"
 
 CONF_FILE="/etc/nginx/sites-available/$FULL_DOMAIN"
 CERT_PATH="/etc/letsencrypt/live/$FULL_DOMAIN/fullchain.pem"
@@ -164,24 +153,80 @@ KEY_PATH="/etc/letsencrypt/live/$FULL_DOMAIN/privkey.pem"
 SSL_OPTIONS="/etc/letsencrypt/options-ssl-nginx.conf"
 SSL_DHPARAMS="/etc/letsencrypt/ssl-dhparams.pem"
 SKIP_CERTBOT=0
+DO_RESET=0
 
-# ─── EXISTING CERT CHECK ──────────────────────────────────────────────────────
-if [[ -f "$CERT_PATH" && -f "$KEY_PATH" ]]; then
-    EXPIRY=$(openssl x509 -enddate -noout -in "$CERT_PATH" 2>/dev/null | cut -d= -f2 || echo "Unknown")
+# ─── EXISTING CONFIG / CERT DETECTION ────────────────────────────────────────
+EXISTING_CONF=0
+EXISTING_CERT=0
+[[ -f "$CONF_FILE" || -f "/etc/nginx/sites-enabled/$FULL_DOMAIN" ]] && EXISTING_CONF=1
+[[ -f "$CERT_PATH" && -f "$KEY_PATH" ]] && EXISTING_CERT=1
 
-    CHOICE=$(whiptail --title "🔐 Existing Certificate Found" \
-        --menu "\nCertificate already exists for:\n  $FULL_DOMAIN\n\nExpires: $EXPIRY\n\nWhat would you like to do?" \
-        16 60 3 \
-        "USE"   "Use existing certificate (skip reissue)" \
-        "RENEW" "Force renew certificate" \
-        "ABORT" "Cancel and exit" \
+if (( EXISTING_CONF == 1 || EXISTING_CERT == 1 )); then
+    STATUS_MSG=""
+    (( EXISTING_CONF == 1 )) && STATUS_MSG+="  • Nginx config found: $CONF_FILE\n"
+    if (( EXISTING_CERT == 1 )); then
+        EXPIRY=$(openssl x509 -enddate -noout -in "$CERT_PATH" 2>/dev/null | cut -d= -f2 || echo "Unknown")
+        STATUS_MSG+="  • SSL certificate found (expires: $EXPIRY)\n"
+    fi
+
+    CHOICE=$(whiptail --title "⚙ Existing Setup Detected" \
+        --menu "\nFound existing setup for:\n  $FULL_DOMAIN\n\n$STATUS_MSG\nWhat do you want to do?" \
+        20 65 4 \
+        "RESET"  "🔄 Full reset — wipe config + cert, start fresh" \
+        "RECONF" "⚙  Reconfigure — keep cert, rewrite nginx config" \
+        "USE"    "✅ Use as-is — just update proxy/port settings" \
+        "ABORT"  "✖  Cancel and exit" \
         3>&1 1>&2 2>&3) || { log "Cancelled."; exit 0; }
 
     case "$CHOICE" in
-        USE)   success "Using existing certificate."; SKIP_CERTBOT=1 ;;
-        RENEW) log "Will force-renew."; SKIP_CERTBOT=0 ;;
-        ABORT) exit 0 ;;
+        RESET)
+            whiptail --title "⚠ Confirm Full Reset" \
+                --yesno "\nThis will:\n  • Delete nginx config for $FULL_DOMAIN\n  • Revoke and delete SSL certificate\n  • Start completely from scratch\n\nAre you sure?" \
+                13 56 || { log "Reset cancelled."; exit 0; }
+            DO_RESET=1
+            SKIP_CERTBOT=0
+            ;;
+        RECONF)
+            log "Reconfiguring nginx, keeping existing certificate."
+            SKIP_CERTBOT=1
+            DO_RESET=0
+            ;;
+        USE)
+            log "Keeping existing cert and nginx, just updating settings."
+            SKIP_CERTBOT=1
+            DO_RESET=0
+            ;;
+        ABORT)
+            exit 0
+            ;;
     esac
+fi
+
+# ─── FULL RESET ───────────────────────────────────────────────────────────────
+if (( DO_RESET == 1 )); then
+    log "Performing full reset for $FULL_DOMAIN..."
+
+    # Remove nginx configs
+    $SUDO rm -f "/etc/nginx/sites-enabled/$FULL_DOMAIN"
+    $SUDO rm -f "/etc/nginx/sites-available/$FULL_DOMAIN"
+    $SUDO rm -f "/etc/nginx/sites-enabled/${FULL_DOMAIN}.conf"
+    $SUDO rm -f "/etc/nginx/sites-available/${FULL_DOMAIN}.conf"
+
+    # Revoke and delete certificate
+    if [[ -f "$CERT_PATH" ]]; then
+        log "Revoking certificate..."
+        $SUDO certbot revoke --cert-path "$CERT_PATH" --non-interactive --agree-tos 2>&1 || \
+            warn "Revoke failed (may already be expired), continuing..."
+        $SUDO certbot delete --cert-name "$FULL_DOMAIN" --non-interactive 2>&1 || \
+            warn "Delete failed, removing manually..."
+        $SUDO rm -rf "/etc/letsencrypt/live/$FULL_DOMAIN"
+        $SUDO rm -rf "/etc/letsencrypt/archive/$FULL_DOMAIN"
+        $SUDO rm -f  "/etc/letsencrypt/renewal/$FULL_DOMAIN.conf"
+    fi
+
+    # Reload nginx to clear any active config
+    $SUDO systemctl reload nginx > /dev/null 2>&1 || true
+    success "Full reset complete."
 fi
 
 # ─── DNS CHECK ────────────────────────────────────────────────────────────────
@@ -201,62 +246,40 @@ fi
 
 if [[ -n "$SERVER_IP" && -n "$DNS_IP" && "$SERVER_IP" != "$DNS_IP" ]]; then
     whiptail --title "⚠ DNS Mismatch" \
-        --yesno "\nDomain:     $FULL_DOMAIN\nServer IP:  $SERVER_IP\nDomain IP:  $DNS_IP\n\nThis domain does NOT point here.\nSSL issuance will likely FAIL.\n\nProceed anyway?" \
-        14 56 || { log "Aborted. Fix DNS and re-run."; exit 1; }
-    warn "Proceeding despite DNS mismatch..."
+        --yesno "\nServer IP:  $SERVER_IP\nDomain IP:  $DNS_IP\n\n$FULL_DOMAIN does NOT point here.\nSSL will likely FAIL.\n\nProceed anyway?" \
+        13 54 || { log "Aborted — fix DNS first."; exit 1; }
+    warn "Proceeding despite mismatch..."
 elif [[ -n "$SERVER_IP" && "$SERVER_IP" == "$DNS_IP" ]]; then
-    whiptail --title "✅ DNS OK" \
-        --msgbox "\nDNS is correct!\n\n  Domain:    $FULL_DOMAIN\n  Server IP: $SERVER_IP" \
-        10 50
+    success "DNS OK — $FULL_DOMAIN → $SERVER_IP"
 fi
 
-# ─── PURGE OLD CONFIG & START CLEAN ───────────────────────────────────────────
-purge_old_nginx_config "$FULL_DOMAIN"
+# ─── CLEAN UP DEFAULT & OLD CONFIGS ──────────────────────────────────────────
+$SUDO rm -f /etc/nginx/sites-enabled/default
+$SUDO rm -f "/etc/nginx/sites-enabled/$FULL_DOMAIN"
+$SUDO rm -f "/etc/nginx/sites-available/$FULL_DOMAIN"
 
-# Write minimal HTTP-only block so certbot can find server_name
-# We do NOT use --redirect here — we handle redirects ourselves in the final config
-$SUDO tee "$CONF_FILE" >/dev/null <<NGINXEOF
-server {
-    listen 80;
-    listen [::]:80;
-    server_name $FULL_DOMAIN;
-
-    location / {
-        return 200 'Setup in progress...';
-        add_header Content-Type text/plain;
-    }
-}
-NGINXEOF
-
-$SUDO ln -sf "$CONF_FILE" /etc/nginx/sites-enabled/
-nginx_test_or_die
-$SUDO systemctl reload nginx > /dev/null 2>&1
-success "Temporary Nginx block live for $FULL_DOMAIN"
-
-# ─── OBTAIN CERTIFICATE (standalone mode — no nginx involvement) ───────────────
-# We use certonly so certbot never touches our nginx config at all.
-# We manage the nginx config 100% ourselves.
+# ─── CERTBOT — STANDALONE MODE (we control nginx entirely) ────────────────────
 if (( SKIP_CERTBOT == 0 )); then
-    log "Stopping Nginx briefly for certbot standalone mode..."
+    log "Stopping Nginx for certbot standalone..."
     $SUDO systemctl stop nginx > /dev/null 2>&1
 
     CERTBOT_SUCCESS=0
     for attempt in 1 2 3; do
+        log "Certbot attempt $attempt/3..."
         if $SUDO certbot certonly \
             --standalone \
+            --preferred-challenges http \
             -d "$FULL_DOMAIN" \
             --non-interactive \
             --agree-tos \
-            --register-unsafely-without-email \
-            --preferred-challenges http 2>&1; then
+            --register-unsafely-without-email 2>&1; then
             CERTBOT_SUCCESS=1
             break
         fi
-
-        warn "Certbot attempt $attempt/3 failed."
+        warn "Attempt $attempt failed."
         if (( attempt < 3 )); then
             whiptail --title "⚠ Certbot Failed ($attempt/3)" \
-                --msgbox "\nAttempt $attempt of 3 failed.\n\nCommon causes:\n  • Port 80 blocked by firewall\n  • DNS not pointing here yet\n  • Let's Encrypt rate limit\n\nRetrying in 15 seconds...\nLog: /var/log/letsencrypt/letsencrypt.log" \
+                --msgbox "\nAttempt $attempt of 3 failed.\n\nCommon causes:\n  • Port 80 blocked by firewall\n  • DNS not propagated yet\n  • Let's Encrypt rate limit\n\nRetrying in 15 seconds...\nLog: /var/log/letsencrypt/letsencrypt.log" \
                 15 60
             sleep 15
         fi
@@ -266,53 +289,52 @@ if (( SKIP_CERTBOT == 0 )); then
     $SUDO systemctl start nginx > /dev/null 2>&1
 
     if (( CERTBOT_SUCCESS == 0 )); then
-        die "Certbot failed after 3 attempts.\n\nTips:\n  sudo ufw allow 80\n  sudo ufw allow 443\n  dig +short $FULL_DOMAIN A\n  cat /var/log/letsencrypt/letsencrypt.log"
+        die "Certbot failed after 3 attempts.\n\nDebug:\n  sudo ufw allow 80\n  sudo ufw allow 443\n  dig +short $FULL_DOMAIN A\n  cat /var/log/letsencrypt/letsencrypt.log"
     fi
-
-    success "SSL certificate obtained!"
+    success "Certificate obtained!"
 fi
 
 # ─── VERIFY CERT FILES ────────────────────────────────────────────────────────
-[[ ! -f "$CERT_PATH" ]] && die "Certificate not found:\n$CERT_PATH"
-[[ ! -f "$KEY_PATH"  ]] && die "Private key not found:\n$KEY_PATH"
+[[ ! -f "$CERT_PATH" ]] && die "Certificate not found: $CERT_PATH"
+[[ ! -f "$KEY_PATH"  ]] && die "Private key not found: $KEY_PATH"
 
-# ─── ENSURE SSL SUPPORT FILES ─────────────────────────────────────────────────
+# ─── SSL SUPPORT FILES ────────────────────────────────────────────────────────
 if [[ ! -f "$SSL_OPTIONS" ]]; then
     warn "Downloading options-ssl-nginx.conf..."
     $SUDO curl -s "https://raw.githubusercontent.com/certbot/certbot/main/certbot-nginx/certbot_nginx/_internal/tls_configs/options-ssl-nginx.conf" \
         -o "$SSL_OPTIONS" || die "Failed to fetch options-ssl-nginx.conf"
 fi
-
 if [[ ! -f "$SSL_DHPARAMS" ]]; then
-    warn "Generating DH params (takes ~30s)..."
-    $SUDO openssl dhparam -out "$SSL_DHPARAMS" 2048 > /dev/null 2>&1 || \
-        die "Failed to generate DH params."
+    warn "Generating DH params (~30s)..."
+    $SUDO openssl dhparam -out "$SSL_DHPARAMS" 2048 > /dev/null 2>&1 || die "Failed to generate DH params."
 fi
-
 success "SSL support files ready."
 
-# ─── PROXY SETUP ──────────────────────────────────────────────────────────────
+# Verify the include files are actually valid paths nginx can read
+[[ ! -f "$SSL_OPTIONS"  ]] && die "SSL options file missing: $SSL_OPTIONS"
+[[ ! -f "$SSL_DHPARAMS" ]] && die "DH params file missing: $SSL_DHPARAMS"
+
+# ─── PROXY PORT ───────────────────────────────────────────────────────────────
 PROXY_PORT=""
 if whiptail --title "🔁 Reverse Proxy" \
-    --yesno "\nForward HTTPS traffic to a local app?\n\nNginx will route:\n  https://$FULL_DOMAIN → 127.0.0.1:PORT\n\nUseful for Flask, Node, Django, etc." \
-    12 58; then
-
+    --yesno "\nForward HTTPS traffic to a local app?\n\n  https://$FULL_DOMAIN → 127.0.0.1:PORT\n\nUseful for Flask, Node, Django, etc." \
+    11 58; then
     while true; do
-        PROXY_PORT=$(whiptail --title "🔁 Local App Port" \
-            --inputbox "\nPort your app listens on:\n\nExamples: 3000  5000  8000  8080" \
-            10 50 3>&1 1>&2 2>&3) || break
-
+        PROXY_PORT=$(whiptail --title "🔁 Port" \
+            --inputbox "\nLocal port your app listens on:\n\nExamples: 3000  5000  8000  8080" \
+            10 48 3>&1 1>&2 2>&3) || break
         if [[ "$PROXY_PORT" =~ ^[0-9]+$ ]] && (( PROXY_PORT >= 1 && PROXY_PORT <= 65535 )); then
             break
         fi
-        whiptail --title "⚠ Invalid Port" --msgbox "Enter a number between 1 and 65535." 8 44
+        whiptail --title "⚠" --msgbox "Enter a valid port (1–65535)." 8 38
     done
 fi
 
-# ─── WRITE FINAL CLEAN NGINX CONFIG ──────────────────────────────────────────
-# Completely replace the file — no certbot modifications, no leftovers
+# ─── WRITE NGINX CONFIG ───────────────────────────────────────────────────────
+log "Writing Nginx config to $CONF_FILE ..."
+
 if [[ -n "$PROXY_PORT" ]]; then
-    $SUDO tee "$CONF_FILE" >/dev/null <<NGINXEOF
+    $SUDO bash -c "cat > '$CONF_FILE'" <<NGINXEOF
 server {
     listen 80;
     listen [::]:80;
@@ -338,21 +360,21 @@ server {
     ssl_stapling_verify       on;
 
     add_header Strict-Transport-Security "max-age=63072000; includeSubDomains; preload" always;
-    add_header X-Content-Type-Options   "nosniff"        always;
-    add_header X-Frame-Options          "SAMEORIGIN"     always;
-    add_header X-XSS-Protection         "1; mode=block"  always;
+    add_header X-Content-Type-Options   "nosniff"       always;
+    add_header X-Frame-Options          "SAMEORIGIN"    always;
+    add_header X-XSS-Protection         "1; mode=block" always;
     add_header Referrer-Policy          "strict-origin-when-cross-origin" always;
 
     location / {
         proxy_pass         http://127.0.0.1:$PROXY_PORT;
-        proxy_set_header   Host               \$host;
-        proxy_set_header   X-Real-IP          \$remote_addr;
-        proxy_set_header   X-Forwarded-For    \$proxy_add_x_forwarded_for;
-        proxy_set_header   X-Forwarded-Proto  \$scheme;
+        proxy_set_header   Host              \$host;
+        proxy_set_header   X-Real-IP         \$remote_addr;
+        proxy_set_header   X-Forwarded-For   \$proxy_add_x_forwarded_for;
+        proxy_set_header   X-Forwarded-Proto \$scheme;
 
         proxy_http_version 1.1;
-        proxy_set_header   Upgrade     \$http_upgrade;
-        proxy_set_header   Connection  "upgrade";
+        proxy_set_header   Upgrade    \$http_upgrade;
+        proxy_set_header   Connection "upgrade";
 
         proxy_connect_timeout  60s;
         proxy_send_timeout     60s;
@@ -364,8 +386,7 @@ server {
 }
 NGINXEOF
 else
-    # Static / no-proxy config
-    $SUDO tee "$CONF_FILE" >/dev/null <<NGINXEOF
+    $SUDO bash -c "cat > '$CONF_FILE'" <<NGINXEOF
 server {
     listen 80;
     listen [::]:80;
@@ -392,50 +413,51 @@ server {
     add_header X-Content-Type-Options "nosniff" always;
 
     root /var/www/html;
-    index index.html;
-
-    location / {
-        try_files \$uri \$uri/ =404;
-    }
+    index index.html index.htm;
+    location / { try_files \$uri \$uri/ =404; }
 }
 NGINXEOF
 fi
 
-# ─── ENSURE SYMLINK ───────────────────────────────────────────────────────────
+log "Config written. Contents:"
+cat "$CONF_FILE"
+
+# ─── ENABLE & TEST ────────────────────────────────────────────────────────────
 $SUDO ln -sf "$CONF_FILE" /etc/nginx/sites-enabled/
 
-# ─── FINAL NGINX TEST & RELOAD ────────────────────────────────────────────────
+log "Running nginx -t ..."
 nginx_test_or_die
-retry 3 5 $SUDO systemctl reload nginx || die "Failed to reload Nginx.\nCheck: journalctl -xe"
-success "Nginx reloaded successfully."
 
-# ─── AUTO-RENEWAL CRON ────────────────────────────────────────────────────────
+log "Reloading nginx..."
+retry 3 5 $SUDO systemctl reload nginx || die "Nginx reload failed.\nRun: journalctl -xe"
+success "Nginx reloaded."
+
+# ─── AUTO-RENEWAL ─────────────────────────────────────────────────────────────
 CRON_JOB="0 3 * * * /usr/bin/certbot renew --quiet --post-hook 'systemctl reload nginx'"
 if ! ($SUDO crontab -l 2>/dev/null | grep -qF 'certbot renew'); then
     ( $SUDO crontab -l 2>/dev/null; echo "$CRON_JOB" ) | $SUDO crontab -
-    success "Auto-renewal cron registered (daily at 3AM)."
+    success "Auto-renewal cron set (daily 3AM)."
 fi
 
 # ─── SUMMARY ──────────────────────────────────────────────────────────────────
 EXPIRY=$(openssl x509 -enddate -noout -in "$CERT_PATH" 2>/dev/null | cut -d= -f2 || echo "Unknown")
 [[ -n "$PROXY_PORT" ]] \
-    && PROXY_LINE="🔁 Proxy:     → 127.0.0.1:$PROXY_PORT" \
-    || PROXY_LINE="🔁 Proxy:     Not configured"
+    && PROXY_LINE="🔁 Proxy:    → 127.0.0.1:$PROXY_PORT" \
+    || PROXY_LINE="🔁 Proxy:    Not configured"
 
-whiptail --title "🎉 Setup Complete!" --msgbox "\
+whiptail --title "🎉 Done!" --msgbox "\
 ╔══════════════════════════════════════╗
 ║         SSL SETUP SUCCESSFUL!        ║
 ╚══════════════════════════════════════╝
 
-🔐 URL:       https://$FULL_DOMAIN
-📂 Config:    $CONF_FILE
-📜 Cert:      $CERT_PATH
-📅 Expires:   $EXPIRY
+🔐 URL:      https://$FULL_DOMAIN
+📂 Config:   $CONF_FILE
+📅 Expires:  $EXPIRY
 $PROXY_LINE
-🔄 Renewal:   Auto (daily at 3AM)
+🔄 Renewal:  Auto (daily at 3AM)
 
-Your site is live and secured with HTTPS!" 19 62
+Your site is live and secured!" 17 60
 
 echo ""
-success "Done! → https://$FULL_DOMAIN"
+success "All done! → https://$FULL_DOMAIN"
 echo ""
