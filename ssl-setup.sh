@@ -352,13 +352,6 @@ server {
     include              $SSL_OPTIONS;
     ssl_dhparam          $SSL_DHPARAMS;
 
-    ssl_protocols             TLSv1.2 TLSv1.3;
-    ssl_prefer_server_ciphers on;
-    ssl_session_cache         shared:SSL:10m;
-    ssl_session_timeout       1d;
-    ssl_stapling              on;
-    ssl_stapling_verify       on;
-
     add_header Strict-Transport-Security "max-age=63072000; includeSubDomains; preload" always;
     add_header X-Content-Type-Options   "nosniff"       always;
     add_header X-Frame-Options          "SAMEORIGIN"    always;
@@ -403,11 +396,6 @@ server {
     ssl_certificate_key  $KEY_PATH;
     include              $SSL_OPTIONS;
     ssl_dhparam          $SSL_DHPARAMS;
-
-    ssl_protocols             TLSv1.2 TLSv1.3;
-    ssl_prefer_server_ciphers on;
-    ssl_session_cache         shared:SSL:10m;
-    ssl_session_timeout       1d;
 
     add_header Strict-Transport-Security "max-age=63072000; includeSubDomains; preload" always;
     add_header X-Content-Type-Options "nosniff" always;
