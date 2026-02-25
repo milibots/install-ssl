@@ -38,7 +38,7 @@ cleanup() {
 trap cleanup EXIT
 
 die() {
-    whiptail --title "❌ Fatal Error" --msgbox "$1" 12 62
+    whiptail --title "❌ Fatal Error" --msgbox "$1" 14 64
     exit 1
 }
 
@@ -54,6 +54,13 @@ retry() {
     done
 }
 
+nginx_test_or_die() {
+    local result
+    result=$($SUDO nginx -t 2>&1) || \
+        die "Nginx config test failed!\n\nError:\n$result\n\nCheck: $CONF_FILE"
+}
+
+# ─── PRIVILEGE CHECK ──────────────────────────────────────────────────────────
 if [[ $EUID -ne 0 ]]; then
     if sudo -n true 2>/dev/null; then
         SUDO="sudo"
@@ -65,12 +72,14 @@ else
     SUDO=""
 fi
 
+# ─── WHIPTAIL ─────────────────────────────────────────────────────────────────
 if ! command -v whiptail &>/dev/null; then
     log "Installing whiptail..."
     $SUDO apt-get install -y whiptail > /dev/null 2>&1 || \
     $SUDO dnf install -y newt > /dev/null 2>&1 || true
 fi
 
+# ─── WELCOME ──────────────────────────────────────────────────────────────────
 whiptail --title "🔐 Nginx SSL Setup" --msgbox "\
 ╔══════════════════════════════════════╗
 ║     NGINX + LET'S ENCRYPT TOOL      ║
@@ -86,19 +95,18 @@ This tool will:
 
 Press OK to continue." 18 50
 
-if [[ ! -f /etc/os-release ]]; then
-    die "Cannot detect OS: /etc/os-release not found."
-fi
+# ─── OS DETECTION ─────────────────────────────────────────────────────────────
+[[ ! -f /etc/os-release ]] && die "Cannot detect OS: /etc/os-release not found."
 source /etc/os-release
 
 case "$ID" in
     ubuntu|debian|kali|pop|linuxmint)
-        PACKAGES="nginx curl certbot python3-certbot-nginx dnsutils whiptail"
+        PACKAGES="nginx curl certbot python3-certbot-nginx dnsutils whiptail openssl"
         UPDATE_CMD="$SUDO apt-get update -y"
         INSTALL_CMD="$SUDO apt-get install -y"
         ;;
     centos|rhel|fedora|almalinux|rocky)
-        PACKAGES="nginx curl certbot python3-certbot-nginx bind-utils newt"
+        PACKAGES="nginx curl certbot python3-certbot-nginx bind-utils newt openssl"
         UPDATE_CMD="$SUDO dnf check-update || true"
         INSTALL_CMD="$SUDO dnf install -y"
         ;;
@@ -107,6 +115,7 @@ case "$ID" in
         ;;
 esac
 
+# ─── INSTALL DEPS ─────────────────────────────────────────────────────────────
 {
     echo 10; echo "# Updating package repositories..."
     bash -c "$UPDATE_CMD" > /dev/null 2>&1 || true
@@ -117,14 +126,13 @@ esac
     echo 100; echo "# Done!"
 } | whiptail --title "📦 Installing Dependencies" --gauge "Preparing..." 8 60 0
 
-for cmd in nginx certbot; do
-    if ! command -v "$cmd" &>/dev/null; then
-        die "$cmd failed to install.\nCheck your internet connection and package sources."
-    fi
+for cmd in nginx certbot openssl; do
+    command -v "$cmd" &>/dev/null || die "$cmd failed to install. Check your internet and package sources."
 done
 
 success "Dependencies ready. Nginx is running."
 
+# ─── DOMAIN INPUT ─────────────────────────────────────────────────────────────
 while true; do
     RAW_DOMAIN=$(whiptail --title "🌐 Domain Setup" \
         --inputbox "\nEnter the domain to secure with SSL:\n\nExamples:\n  example.com\n  sub.example.com" \
@@ -135,10 +143,14 @@ while true; do
     whiptail --title "⚠ Invalid Input" --msgbox "Domain cannot be empty. Please try again." 8 45
 done
 
+CONF_FILE="/etc/nginx/sites-available/$FULL_DOMAIN"
 CERT_PATH="/etc/letsencrypt/live/$FULL_DOMAIN/fullchain.pem"
 KEY_PATH="/etc/letsencrypt/live/$FULL_DOMAIN/privkey.pem"
+SSL_OPTIONS="/etc/letsencrypt/options-ssl-nginx.conf"
+SSL_DHPARAMS="/etc/letsencrypt/ssl-dhparams.pem"
 SKIP_CERTBOT=0
 
+# ─── EXISTING CERT CHECK ──────────────────────────────────────────────────────
 if [[ -f "$CERT_PATH" && -f "$KEY_PATH" ]]; then
     EXPIRY=$(openssl x509 -enddate -noout -in "$CERT_PATH" 2>/dev/null | cut -d= -f2 || echo "Unknown")
 
@@ -157,6 +169,7 @@ if [[ -f "$CERT_PATH" && -f "$KEY_PATH" ]]; then
     esac
 fi
 
+# ─── DNS CHECK ────────────────────────────────────────────────────────────────
 log "Checking DNS for $FULL_DOMAIN..."
 
 SERVER_IP=""
@@ -193,10 +206,10 @@ elif [[ -n "$SERVER_IP" && "$SERVER_IP" == "$DNS_IP" ]]; then
         11 50
 fi
 
+# ─── CLEAN DEFAULT CONFIG ─────────────────────────────────────────────────────
 [[ -f /etc/nginx/sites-enabled/default ]] && $SUDO rm -f /etc/nginx/sites-enabled/default
 
-CONF_FILE="/etc/nginx/sites-available/$FULL_DOMAIN"
-
+# ─── CREATE TEMP NGINX BLOCK (required so certbot --nginx finds server_name) ──
 $SUDO tee "$CONF_FILE" >/dev/null <<NGINXEOF
 server {
     listen 80;
@@ -211,12 +224,11 @@ server {
 NGINXEOF
 
 $SUDO ln -sf "$CONF_FILE" /etc/nginx/sites-enabled/
-
-$SUDO nginx -t > /dev/null 2>&1 || die "Nginx config test failed. Check /etc/nginx/sites-available/$FULL_DOMAIN"
+nginx_test_or_die
 $SUDO systemctl reload nginx > /dev/null 2>&1
-
 success "Nginx server block created for $FULL_DOMAIN"
 
+# ─── CERTBOT ──────────────────────────────────────────────────────────────────
 if (( SKIP_CERTBOT == 0 )); then
     log "Requesting SSL certificate from Let's Encrypt..."
     CERTBOT_SUCCESS=0
@@ -235,25 +247,39 @@ if (( SKIP_CERTBOT == 0 )); then
         warn "Certbot attempt $attempt/3 failed."
         if (( attempt < 3 )); then
             whiptail --title "⚠ Certbot Failed (Attempt $attempt/3)" \
-                --msgbox "\nCertbot failed on attempt $attempt of 3.\n\nCommon causes:\n  • Port 80 or 443 blocked by firewall\n  • DNS not yet propagated to Let's Encrypt\n  • Let's Encrypt rate limit hit\n\nWill retry in 15 seconds...\nCheck logs: /var/log/letsencrypt/letsencrypt.log" \
-                15 58
+                --msgbox "\nCertbot failed on attempt $attempt of 3.\n\nCommon causes:\n  • Port 80 or 443 blocked by firewall\n  • DNS not yet propagated\n  • Let's Encrypt rate limit\n\nWill retry in 15 seconds...\nSee: /var/log/letsencrypt/letsencrypt.log" \
+                15 60
             sleep 15
         fi
     done
 
     if (( CERTBOT_SUCCESS == 0 )); then
-        die "Certbot failed after 3 attempts.\n\nTroubleshooting:\n  • sudo ufw allow 80 && sudo ufw allow 443\n  • Verify DNS: dig +short $FULL_DOMAIN A\n  • View logs: /var/log/letsencrypt/letsencrypt.log"
+        die "Certbot failed after 3 attempts.\n\nTroubleshooting:\n  • sudo ufw allow 80 && sudo ufw allow 443\n  • dig +short $FULL_DOMAIN A\n  • cat /var/log/letsencrypt/letsencrypt.log"
     fi
 
     success "SSL certificate obtained for $FULL_DOMAIN!"
 fi
 
-CERT_PATH="/etc/letsencrypt/live/$FULL_DOMAIN/fullchain.pem"
-KEY_PATH="/etc/letsencrypt/live/$FULL_DOMAIN/privkey.pem"
+# ─── VERIFY CERT FILES EXIST ─────────────────────────────────────────────────
+[[ ! -f "$CERT_PATH" ]] && die "Certificate not found:\n  $CERT_PATH\n\nRun certbot manually to debug."
+[[ ! -f "$KEY_PATH"  ]] && die "Private key not found:\n  $KEY_PATH\n\nRun certbot manually to debug."
 
-[[ ! -f "$CERT_PATH" || ! -f "$KEY_PATH" ]] && \
-    die "Certificate files missing after certbot.\n  $CERT_PATH\n  $KEY_PATH"
+# ─── ENSURE SSL OPTIONS FILES EXIST (certbot should create them, fallback if not) ──
+if [[ ! -f "$SSL_OPTIONS" ]]; then
+    warn "options-ssl-nginx.conf missing — downloading from certbot repo..."
+    $SUDO curl -s "https://raw.githubusercontent.com/certbot/certbot/main/certbot-nginx/certbot_nginx/_internal/tls_configs/options-ssl-nginx.conf" \
+        -o "$SSL_OPTIONS" || die "Failed to download options-ssl-nginx.conf"
+fi
 
+if [[ ! -f "$SSL_DHPARAMS" ]]; then
+    warn "ssl-dhparams.pem missing — generating (this may take a moment)..."
+    $SUDO openssl dhparam -out "$SSL_DHPARAMS" 2048 > /dev/null 2>&1 || \
+        die "Failed to generate DH params."
+fi
+
+success "SSL support files verified."
+
+# ─── PROXY SETUP ──────────────────────────────────────────────────────────────
 PROXY_PORT=""
 if whiptail --title "🔁 Reverse Proxy" \
     --yesno "\nForward HTTPS traffic to a local application?\n\nExample: your app runs on port 3000 or 8080.\nNginx will route:\n  https://$FULL_DOMAIN → 127.0.0.1:PORT" \
@@ -267,10 +293,11 @@ if whiptail --title "🔁 Reverse Proxy" \
         if [[ "$PROXY_PORT" =~ ^[0-9]+$ ]] && (( PROXY_PORT >= 1 && PROXY_PORT <= 65535 )); then
             break
         fi
-        whiptail --title "⚠ Invalid Port" --msgbox "Enter a valid port number between 1 and 65535." 8 48
+        whiptail --title "⚠ Invalid Port" --msgbox "Enter a valid port number between 1 and 65535." 8 50
     done
 fi
 
+# ─── WRITE FINAL NGINX CONFIG ─────────────────────────────────────────────────
 if [[ -n "$PROXY_PORT" ]]; then
     $SUDO tee "$CONF_FILE" >/dev/null <<NGINXEOF
 server {
@@ -287,8 +314,8 @@ server {
 
     ssl_certificate $CERT_PATH;
     ssl_certificate_key $KEY_PATH;
-    include /etc/letsencrypt/options-ssl-nginx.conf;
-    ssl_dhparam /etc/letsencrypt/ssl-dhparams.pem;
+    include $SSL_OPTIONS;
+    ssl_dhparam $SSL_DHPARAMS;
 
     ssl_protocols TLSv1.2 TLSv1.3;
     ssl_prefer_server_ciphers on;
@@ -324,24 +351,28 @@ server {
     }
 }
 NGINXEOF
-    success "Proxy config written for port $PROXY_PORT."
+    success "Proxy config written: https://$FULL_DOMAIN → 127.0.0.1:$PROXY_PORT"
 else
     log "No proxy configured — keeping Certbot's default setup."
 fi
 
-$SUDO nginx -t > /dev/null 2>&1 || die "Final Nginx config test failed.\nCheck: $CONF_FILE\nRun: sudo nginx -t"
+# ─── VALIDATE & RELOAD NGINX ──────────────────────────────────────────────────
+nginx_test_or_die
 retry 3 5 $SUDO systemctl reload nginx || die "Failed to reload Nginx.\nCheck: journalctl -xe"
-success "Nginx reloaded."
+success "Nginx reloaded successfully."
 
+# ─── AUTO-RENEWAL CRON ────────────────────────────────────────────────────────
 CRON_JOB="0 3 * * * /usr/bin/certbot renew --quiet --post-hook 'systemctl reload nginx'"
 if ! ($SUDO crontab -l 2>/dev/null | grep -qF 'certbot renew'); then
     ( $SUDO crontab -l 2>/dev/null; echo "$CRON_JOB" ) | $SUDO crontab -
     success "Auto-renewal cron registered (runs daily at 3AM)."
 fi
 
+# ─── FINAL SUMMARY ────────────────────────────────────────────────────────────
 EXPIRY=$(openssl x509 -enddate -noout -in "$CERT_PATH" 2>/dev/null | cut -d= -f2 || echo "Unknown")
-[[ -n "$PROXY_PORT" ]] && PROXY_LINE="Proxy:     https://$FULL_DOMAIN → 127.0.0.1:$PROXY_PORT" \
-                       || PROXY_LINE="Proxy:     Not configured"
+[[ -n "$PROXY_PORT" ]] \
+    && PROXY_LINE="Proxy:     https://$FULL_DOMAIN → 127.0.0.1:$PROXY_PORT" \
+    || PROXY_LINE="Proxy:     Not configured"
 
 whiptail --title "🎉 Setup Complete!" --msgbox "\
 ╔══════════════════════════════════════╗
